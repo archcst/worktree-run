@@ -65,7 +65,7 @@ wtr runs
 
 交互 issue 列表只包含分配给当前 Linear 用户的未完成任务，排除 `completed`、`canceled` 和 `duplicate` 状态；选中后会再次核对状态和负责人。手动指定 issue 编号仍可访问该任务。
 
-多工作区：任何命令均可加 `--workspace <slug>`。启动时查询组织 UUID，之后显式传递 workspace slug；提示词同时包含 slug、组织 UUID 和带 `--workspace` 的查询命令。不会修改 Linear 当前默认工作区，也不会更新 issue 状态。
+多工作区：任何命令均可加 `--workspace <slug>`。启动时查询组织 UUID，之后显式传递 workspace slug；提示词包含英文的 workspace 上下文（slug、组织 UUID），并要求所有 Linear 查询显式使用 `--workspace`。不会修改 Linear 当前默认工作区，也不会更新 issue 状态。
 
 ### 脚本与快捷配置
 

@@ -54,6 +54,16 @@ class ProjectPromptTests(Sandbox):
             prompt.initialize("ws-uuid", "project-1").read_text(), "FIRST {{issue_id}}"
         )
 
+    def test_render_prepends_english_workspace_context(self):
+        path = prompt.initialize("ws-uuid", "project-1")
+        path.write_text("项目规则 {{issue_id}}")
+        self.assertEqual(
+            prompt.render("ENG-123", "test-space", "ws-uuid", "project-1"),
+            "Linear workspace: test-space (organization ID: ws-uuid)\n"
+            "All Linear queries must explicitly use --workspace test-space.\n\n"
+            "项目规则 ENG-123",
+        )
+
     def test_template_identity_cannot_escape_config_directory(self):
         for workspace, project in (
             ("../ws", "project-1"),
