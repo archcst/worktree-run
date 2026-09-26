@@ -41,8 +41,30 @@ class TmuxTests(Sandbox):
         self.assertEqual(finished["exit_code"], 0)
         self.assertFalse((Path(run["cwd"]) / "BAD").exists())
         tmux = Tmux()
-        self.wait_for(lambda: tmux.locate(self.store, finished)["dead"] == "1")
-        capture = tmux.call("capture-pane", "-p", "-t", run["pane_id"]).stdout
+
+        def pane_state():
+            # The window hosts a plain interactive shell; the typed command stays
+            # visible in it and the prompt returns after the wrapper exits.
+            capture = tmux.call("capture-pane", "-p", "-S", "-", "-t", run["pane_id"]).stdout
+            if "已回到 worktree 的 shell" not in capture:
+                return None
+            dead, cwd = (
+                tmux.call(
+                    "display-message",
+                    "-p",
+                    "-t",
+                    run["pane_id"],
+                    "#{pane_dead}\t#{pane_current_path}",
+                )
+                .stdout.strip()
+                .split("\t")
+            )
+            return (dead, cwd, capture) if dead == "0" else None
+
+        dead, cwd, capture = self.wait_for(pane_state)
+        self.assertEqual(dead, "0")
+        self.assertEqual(Path(cwd).resolve(), Path(run["cwd"]).resolve())
+        self.assertIn("_run", capture)
         self.assertIn("AGENT FINISHED", capture)
         second = self.launch()
         self.assertNotEqual(second["id"], run["id"])
@@ -107,7 +129,7 @@ class TmuxTests(Sandbox):
         self.assertEqual(recovered["pane_id"], run["pane_id"])
         self.assertEqual(recovered["status"], "running")
 
-    def test_launch_command_recovers_untagged_pane(self):
+    def test_untagged_pane_is_reported_interrupted(self):
         self.configure(delay="30")
         run = self.launch()
         self.wait_for(lambda: self.output_file.exists())
@@ -117,8 +139,8 @@ class TmuxTests(Sandbox):
         self.store.update_run(run["id"], pane_id=None, window_id=None, session_id=None)
         with self.store.lock():
             runner.recover(self.store)
-        self.assertEqual(self.store.run(run["id"])["pane_id"], run["pane_id"])
-        self.assertEqual(self.store.run(run["id"])["status"], "running")
+        self.assertEqual(self.store.run(run["id"])["status"], "interrupted")
+        self.assertIsNone(self.store.active("ws-uuid", ISSUE["id"]))
 
     def test_repo_cannot_shadow_internal_module(self):
         self.configure()

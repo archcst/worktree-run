@@ -145,7 +145,7 @@ EDITOR=nano wtr prompt edit
 - 路径、已有分支和其他 worktree 冲突会报错，不覆盖、重置或删除内容。已知跨 workspace 重名使用稳定 hash 后缀消歧。
 - 同一数据库通过文件锁协调准备过程，并用 SQLite 唯一索引约束同 issue 的活动执行。请让同机调用共享数据库；跨数据库/跨机器不提供协调。
 - 保存 tmux socket、session/window/pane ID，并用执行 UUID 标记 pane，不依赖窗口名称；已有活动窗口仅定位。
-- 包装进程记录退出码：0 为 `awaiting_review`，非 0 为 `failed`，**不代表 issue 已完成**。agent 退出保留 pane 输出；再次手动启动创建新批次。
+- 包装进程记录退出码：0 为 `awaiting_review`，非 0 为 `failed`，**不代表 issue 已完成**。窗口本身是普通交互 shell，wtr 把内部执行命令输入该窗口运行；agent 退出后回到提示符，可用 ↑ 重跑。再次手动启动创建新批次。用户退出 shell 时窗口按 `remain-on-exit` 保留输出。
 - `wtr runs` 和启动前会校验遗留 pane，将消失/异常退出的活动记录标记为 `interrupted`；仍存活的 pane 不重复启动。
 - 创建失败或后续失败保留 worktree/关联和错误记录。解决冲突后重试相同命令。异常退出若留下存活 pane，需先检查该 pane 再自行关闭，避免重复工作。
 - 无交互终端时不 attach；在 tmux 内切换当前客户端，在外部 attach。另一个 tmux server 中的窗口仅输出定位信息。

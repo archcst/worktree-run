@@ -71,6 +71,5 @@ def render(identifier, workspace, workspace_id, project_id):
     # Prefix also prevents CLI prompt text beginning with '-' or '@' from becoming an option/file.
     return (
         f"Linear workspace: {workspace} (organization ID: {workspace_id})\n"
-        f"All Linear queries must explicitly use --workspace {shlex.quote(workspace)}.\n\n"
-        + result
+        f"All Linear queries must explicitly use --workspace {shlex.quote(workspace)}.\n\n" + result
     )

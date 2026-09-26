@@ -5,6 +5,7 @@ import os
 import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from .util import Error, execute, require
@@ -79,25 +80,16 @@ class Tmux:
             )
         return panes
 
-    @staticmethod
-    def store_token(store):
-        return hashlib.sha256(str(store.path).encode()).hexdigest()
-
-    def launch_marker(self, store, run_id):
-        return f"WTR_LAUNCH_TOKEN={self.store_token(store)}:{run_id}"
-
     def locate(self, store, run):
         token = self.store_token(store)
         for pane in self.panes():
-            tagged = pane["run"] == run["id"] and pane["store"] == token
-            # Handles orchestrator dying between new-window and persisting pane IDs/tags.
-            # tmux shell-quotes pane_start_command. The generated ASCII marker survives
-            # that formatting, including when paths contain spaces or quotes.
-            marker = self.launch_marker(store, run["id"])
-            launching = bool(run["launch_command"]) and marker in pane["command"]
-            if tagged or launching:
+            if pane["run"] == run["id"] and pane["store"] == token:
                 return pane
         return None
+
+    @staticmethod
+    def store_token(store):
+        return hashlib.sha256(str(store.path).encode()).hexdigest()
 
     def tag(self, store, run_id, pane_id):
         self.call("set-option", "-p", "-t", pane_id, "@wtr_run", run_id)
@@ -107,37 +99,63 @@ class Tmux:
 
     def create(self, store, run, session, name):
         source = str(Path(__file__).resolve().parent.parent)
-        # Only trusted local paths/configuration and the generated UUID enter the shell.
-        command = "exec " + shlex.join(
-            [
-                "env",
-                self.launch_marker(store, run["id"]),
-                "PATH=" + os.environ.get("PATH", ""),
-                "PYTHONPATH=" + source,
-                sys.executable,
-                "-P",
-                "-m",
-                "worktree_run",
-                "--db",
-                str(store.path),
-                "_run",
-                run["id"],
-            ]
-        )
-        store.update_run(run["id"], launch_command=command)
+        # The window hosts a normal interactive shell and wtr types its internal
+        # entry point into it, so the shell and the pane survive the agent exiting.
+        # Only trusted local paths and the generated UUID enter the typed command.
+        env = ["-e", "PATH=" + os.environ.get("PATH", "")]
+        if os.environ.get("SHELL"):
+            env += ["-e", "SHELL=" + os.environ["SHELL"]]
         exists = self.call("has-session", "-t", "=" + session, check=False).returncode == 0
         if exists:
             args = ["new-window", "-d", "-P", "-F", FORMAT, "-t", session + ":", "-n", name]
         else:
             args = ["new-session", "-d", "-P", "-F", FORMAT, "-s", session, "-n", name]
-        output = self.call(*args, "-c", run["cwd"], command).stdout.strip().split("\t")
+        output = self.call(*args, *env, "-c", run["cwd"]).stdout.strip().split("\t")
         if len(output) != 4:
             raise Error("tmux 未返回有效的 session/window/pane ID")
         sid, wid, pid, socket = output
         store.update_run(run["id"], session_id=sid, window_id=wid, pane_id=pid)
         store.write("UPDATE runs SET tmux_socket=? WHERE id=?", (socket, run["id"]))
         self.tag(store, run["id"], pid)
+        self.type_command(
+            pid,
+            "PYTHONPATH="
+            + shlex.quote(source)
+            + " "
+            + shlex.join(
+                [
+                    sys.executable,
+                    "-P",
+                    "-m",
+                    "worktree_run",
+                    "--db",
+                    str(store.path),
+                    "_run",
+                    run["id"],
+                ]
+            ),
+        )
         return store.run(run["id"])
+
+    def type_command(self, pane_id, command):
+        # Wait until the shell is up, so the typed line is read as normal input
+        # (terminal input stays buffered while rc files are still loading).
+        deadline = time.monotonic() + 10
+        while True:
+            info = (
+                self.call(
+                    "display-message", "-p", "-t", pane_id, "#{pane_dead}\t#{pane_current_command}"
+                )
+                .stdout.strip()
+                .split("\t")
+            )
+            if len(info) == 2 and info[0] == "0" and info[1]:
+                break
+            if time.monotonic() > deadline:
+                raise Error("等待新窗口 shell 就绪超时")
+            time.sleep(0.05)
+        self.call("send-keys", "-t", pane_id, "-l", command)
+        self.call("send-keys", "-t", pane_id, "Enter")
 
     def focus(self, run):
         target = f"{run['session_id']}:{run['window_id']}"

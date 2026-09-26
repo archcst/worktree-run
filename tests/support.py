@@ -74,6 +74,7 @@ class Sandbox(unittest.TestCase):
                 "XDG_DATA_HOME": str(self.base / "data"),
                 "WTR_TMUX_SOCKET": str(self.base / "tmux.sock"),
                 "WTR_TMUX_CONFIG": "/dev/null",
+                "SHELL": "/bin/sh",
                 "PATH": str(self.base) + os.pathsep + os.environ["PATH"],
             },
         )

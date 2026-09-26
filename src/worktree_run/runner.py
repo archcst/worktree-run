@@ -69,7 +69,7 @@ def launch(store, linear, issue, binding, agent_name):
         # If window creation succeeded but acknowledgement failed, do not release the claim.
         run = store.run(run_id)
         try:
-            pane = tmux.locate(store, run) if run["launch_command"] else None
+            pane = tmux.locate(store, run)
         except Error:
             pane = True  # Uncertain liveness: preserve claim for recovery, not duplicate work.
         if not pane:
@@ -87,9 +87,10 @@ def internal_run(store, run_id):
     if not pane_id:
         raise Error("内部执行入口只能在关联 tmux pane 内运行")
     tmux = Tmux(os.environ.get("TMUX", "").split(",")[0] or run["tmux_socket"])
-    # Tag/retain before waiting for the parent to finish its setup transaction.
-    pane = tmux.locate(store, run)
-    if not pane or pane["pane_id"] != pane_id:
+    # The wrapper runs inside the shell window wtr created; claim the pane before
+    # the parent finishes its setup transaction (covers a crash between the two).
+    owner = tmux.call("show-options", "-v", "-p", "-t", pane_id, "@wtr_run", check=False)
+    if owner.stdout.strip() not in ("", run_id):
         raise Error("当前 tmux pane 不属于该执行批次")
     tmux.tag(store, run_id, pane_id)
     with store.lock():
@@ -97,6 +98,9 @@ def internal_run(store, run_id):
         if run["status"] != "preparing":
             raise Error("执行批次已启动或结束，拒绝重复执行")
         worktree.inspect(store.issue(run["workspace"], run["issue_id"]), associated=True)
+        pane = next((p for p in tmux.panes() if p["pane_id"] == pane_id), None)
+        if pane is None:
+            raise Error("执行窗口已关闭")
         store.write("UPDATE runs SET tmux_socket=? WHERE id=?", (pane["socket"], run_id))
         store.update_run(
             run_id,
@@ -137,5 +141,5 @@ def internal_run(store, run_id):
             exit_code=code,
             error=error,
         )
-    print(f"\n[wtr] agent 已退出，exit={code}；输出和 worktree 已保留。", flush=True)
+    print(f"\n[wtr] agent 已退出，exit={code}；已回到 worktree 的 shell。", flush=True)
     return code if code >= 0 else 128 - code
