@@ -35,7 +35,7 @@ class Agent:
 BUILTINS = {
     agent.name: agent
     for agent in (
-        Agent("pi", "pi", ("pi",)),
+        Agent("pi", "pi", ("pi", "--approve")),
         Agent("codex", "OpenAI Codex", ("codex",)),
         Agent("claude", "Claude Code", ("claude",)),
         Agent("opencode", "OpenCode", ("opencode", "--prompt")),

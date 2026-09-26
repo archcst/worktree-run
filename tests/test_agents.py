@@ -23,7 +23,7 @@ class AgentTests(Sandbox):
     def test_builtin_interactive_argument_boundaries(self):
         text = "Linear workspace: test\nENG-123 中文 ' \" $(touch BAD)\n" + "长" * 20000
         commands = {
-            "pi": ["pi"],
+            "pi": ["pi", "--approve"],
             "codex": ["codex"],
             "claude": ["claude"],
             "opencode": ["opencode", "--prompt"],
