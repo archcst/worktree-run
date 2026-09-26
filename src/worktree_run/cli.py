@@ -95,6 +95,7 @@ def select_issue(issues):
                 "--delimiter=\t",
                 "--with-nth=2..",
                 "--prompt=Linear issue > ",
+                "--preview-window=right,50%,wrap",
                 "--preview",
                 command,
             ],
