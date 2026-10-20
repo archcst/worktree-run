@@ -55,6 +55,15 @@ def launch(store, linear, issue, binding, agent_name):
     store.save_issue(row)
     run_id = store.new_run(row, agent_name, argv, tmux.endpoint)
     try:
+        if issue.get("project"):
+            store.save_project(
+                dict(
+                    workspace=linear.workspace,
+                    workspace_slug=linear.slug,
+                    project_id=issue["project"]["id"],
+                    name=issue["project"]["name"],
+                )
+            )
         prompt.initialize(row["workspace"], row["project_id"])
         worktree.prepare(row, associated=associated)
         name = issue["identifier"]

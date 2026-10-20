@@ -21,6 +21,7 @@ ISSUE = dict(
     project={"id": "project-1", "name": "Project"},
     state={"name": "Todo", "type": "unstarted"},
     assignee={"id": "me"},
+    labels={"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}},
 )
 
 LINEAR_SCRIPT = """#!PYTHON
@@ -40,7 +41,7 @@ elif "organization" in query:
 elif "issue(id:" in query:
     data = {"issue": fixture["issues"][0]}
 else:
-    field = "issues" if "issues(" in query else "projects"
+    field = "issues" if "issues(" in query else ("issueLabels" if "issueLabels(" in query else "projects")
     records = fixture[field]
     cursor = variables.get("after")
     page = int(cursor or 0)
@@ -93,16 +94,26 @@ class Sandbox(unittest.TestCase):
         self.binding = dict(
             workspace="ws-uuid",
             workspace_slug="test-space",
-            project_id="project-1",
+            kind="project",
+            target_id="project-1",
             name="Project",
+            team_name="",
             repo=str(self.repo),
             baseline="main",
             root=str(self.base / "trees"),
         )
-        self.store.save_project(self.binding)
+        self.store.save_binding(self.binding)
         self.fixture = self.base / "linear.json"
         self.fixture.write_text(
-            json.dumps({"issues": [ISSUE], "projects": [{"id": "project-1", "name": "Project"}]})
+            json.dumps(
+                {
+                    "issues": [ISSUE],
+                    "projects": [{"id": "project-1", "name": "Project"}],
+                    "issueLabels": [
+                        {"id": "label-1", "name": "repo:app", "team": None, "isGroup": False}
+                    ],
+                }
+            )
         )
         fake = self.base / "linear"
         fake.write_text(LINEAR_SCRIPT.replace("#!PYTHON", "#!" + sys.executable))

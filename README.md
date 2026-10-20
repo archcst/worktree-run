@@ -23,11 +23,11 @@ wtr config
 
 ```text
 wtr 配置
-├── 项目管理         绑定当前仓库、编辑基线和 worktree 目录、解除绑定
+├── 仓库绑定         选择 Project 或 Label、绑定当前仓库、编辑基线和目录
 ├── 项目提示词       选择项目后打开编辑器
 ├── 默认 agent       查看安装状态、设置默认值或改为每次选择
 ├── tmux session     修改新任务使用的 session 名称
-├── 工作区筛选       选择本次配置的项目范围
+├── 工作区筛选       选择本次配置的绑定和提示词项目范围
 ├── 查看当前配置     查看设置与配置文件位置
 └── 退出
 ```
@@ -41,15 +41,15 @@ wtr 配置
 | 确认 | `Enter` |
 | 返回或退出当前菜单 | `Esc`、`Ctrl+g`、`q`（也支持 `Ctrl+C`） |
 | 普通菜单定位 | 数字键 |
-| 项目列表搜索 | `/` 进入搜索，`Ctrl+U` 清空 |
+| 绑定和项目列表搜索 | `/` 进入搜索，`Ctrl+U` 清空 |
 
 搜索输入期间，`j/k/g/G/q` 都是普通文字，仍可使用方向键或 `Ctrl+n/p` 选择结果、Enter 确认。按 `Esc` 或 `Ctrl+g` 返回导航模式并保留筛选，再按一次返回上级菜单。
 
 这些快捷键用于菜单导航；文本输入框预填当前值，路径支持 Tab 补全。确认后即时保存；取消当前输入不会保存该次修改，返回/退出不会撤销已经保存的设置。提示词以编辑器保存结果为准。
 
-可以在任意目录打开菜单管理已有配置；新增绑定或重新绑定当前仓库时，需要从 main worktree 根目录运行 `wtr config`。修改项目设置和解除绑定只影响新任务，保留已有 worktree、提示词和执行记录。解除绑定需要单独确认。
+可以在任意目录打开菜单管理已有配置；新增绑定或重新绑定当前仓库时，需要从 main worktree 根目录运行 `wtr config`。每条绑定先选择 **Project 或 Label**，再选择对应的完整对象，最后配置仓库的基线和 worktree 目录。Label 例如 `repo:imh-hub`，按完整对象 ID 匹配；同名标签显示所属团队或 Workspace。在已有绑定的「修改匹配方式/对象」中，可以直接切换 Project/Label 或更换对象；仓库路径、基线和 worktree 目录保留。确认后原子更新，目标已被其他绑定占用时拒绝覆盖。修改和解除绑定只影响新任务，保留已有 worktree、提示词和执行记录。解除绑定需要单独确认。
 
-工作区筛选仅在本次配置期间生效，不改变 Linear CLI 的默认工作区。打开菜单、编辑已有配置和提示词均无需查询 Linear；只有新增项目绑定会查询 Linear。菜单和编辑器等待期间不会持有任务启动锁。
+工作区筛选仅在本次配置期间生效，不改变 Linear CLI 的默认工作区。打开菜单、编辑已有绑定和已缓存项目的提示词均无需查询 Linear；新增绑定或选择其他提示词项目时查询 Linear。菜单和编辑器等待期间不会持有任务启动锁。
 
 配置完成后：
 
@@ -69,24 +69,39 @@ wtr runs
 
 ### 脚本与快捷配置
 
-也可使用参数化命令完成配置。`wtr project add` 必须在 Git **主 worktree 的根目录**执行，自动使用当前目录。这里的 main worktree 指仓库的主工作区，与当前检出的分支名称无关。在子目录或附加 worktree 中运行会提示应进入的主工作区路径。
+也可使用参数化命令完成配置。`wtr binding add` 必须在 Git **主 worktree 的根目录**执行，自动使用当前目录。这里的 main worktree 指仓库的主工作区，与当前检出的分支名称无关。在子目录或附加 worktree 中运行会提示应进入的主工作区路径。
 
-issue worktree 根目录默认是当前仓库目录。路径会预填到输入框，可直接编辑、按 Tab 补全目录，或回车确认。例如在 `/projects/my-app` 中绑定时，预填 `/projects/my-app`，issue worktree 会创建在其子目录中（如 `/projects/my-app/eng-123`）。`project edit` 预填已保存的目录；也可用 `--root` 显式指定。
+issue worktree 根目录默认是当前仓库目录。路径会预填到输入框，可直接编辑、按 Tab 补全目录，或回车确认。例如在 `/projects/my-app` 中绑定时，预填 `/projects/my-app`，issue worktree 会创建在其子目录中（如 `/projects/my-app/eng-123`）。`binding edit` 预填已保存的目录；也可用 `--root` 显式指定。
 
 ```bash
 cd /absolute/main-worktree
-wtr --workspace my-team project add PROJECT_ID \
+wtr --workspace my-team binding add --label 'repo:my-app' \
   --baseline origin/main --root /absolute/issue-worktrees
-wtr project list
-wtr project edit PROJECT_ID --baseline origin/develop
-wtr project remove PROJECT_ID
+# 也可选择 Project；每条绑定只能指定一种类型
+wtr --workspace my-team binding add --project PROJECT_ID \
+  --baseline origin/main --root /absolute/issue-worktrees
+wtr binding list
+wtr binding edit LABEL_ID --kind label --baseline origin/develop
+# 将已有 Project 绑定直接改为 Label，保留仓库设置
+wtr binding edit PROJECT_ID --kind project --label 'repo:my-app'
+# 更换同类型的匹配对象也使用 --project 或 --label
+wtr binding edit LABEL_ID --kind label --label 'repo:another-app'
+wtr binding remove LABEL_ID --kind label
 wtr config set agent pi
 wtr config set tmux-session worktree-run
 wtr config list
 wtr agent list
 ```
 
-未绑定项目/无项目的 issue 在交互终端中引导选择仓库；有项目时可选择保存绑定。已有 issue 关联始终复用原仓库；修改/删除项目绑定只影响新 issue，不删除任何 worktree 或历史记录。
+仓库解析规则：
+
+- 已有 issue 关联始终复用原仓库，即使其 Project、Label 或绑定配置发生变化。
+- 新 issue 同时检查其 Project 和全部 Labels，按 workspace、类型及对象 ID 查找绑定。只有一条匹配时自动使用。
+- 多条匹配时，在交互终端明确选择本次使用的一条；非交互和 `--dry-run` 报告匹配项并停止。不会按类型设置隐含优先级，也不会启动多个仓库。
+- 没有匹配时提示配置「仓库绑定」。交互启动也可以从 issue 的 Project/Labels 中选择一个对象并填写仓库配置；无可用对象时需先为 issue 指定 Project 或 Label。
+- 修改/删除绑定不删除任何 worktree、项目提示词或历史记录。
+
+本版使用 `wtr binding` 管理仓库映射。已有安装需在 `wtr config` 中重新配置绑定；原项目绑定不自动转入，已有 issue 关联、执行记录和模板文件保留。
 
 ## 项目提示词
 
@@ -94,14 +109,16 @@ wtr agent list
 
 ```bash
 wtr prompt edit                  # 在仓库或已关联的 issue worktree 内识别项目
-wtr prompt edit "项目名称"         # 在任意目录指定绑定项目（也可用 project ID）
+wtr prompt edit "项目名称"         # 在任意目录指定项目（也可用 project ID）
 wtr --workspace my-team prompt edit PROJECT_ID
 EDITOR=nano wtr prompt edit
 ```
 
-无法从当前目录识别项目时会提供项目选择；一个目录绑定多个项目时也需选择。编辑过程只读取本地绑定，不需要查询 Linear。编辑器使用 `VISUAL`、`EDITOR` 或 `vi`，命令会显示实际模板路径。
+项目提示词独立于仓库绑定；使用 Label 路由时，仍按 issue 当前所属 Project 加载模板。无 Project 的 issue 使用内置默认提示词。
 
-新建绑定、首次编辑或实际启动时，为项目初始化默认模板；编辑已有项目配置或重新绑定同一项目会保留其模板内容。模板必须包含 `{{issue_id}}`，例如：
+可从 Project 绑定的仓库或已关联的 issue worktree 识别提示词项目；一个目录对应多个 Project 时需选择。Label 本身不能用于推断项目。菜单提供已缓存项目，以及「选择其他 Linear 项目」入口，允许为尚未绑定仓库的项目编辑提示词。`wtr prompt edit <项目名称或ID>` 在本地未找到项目时会查询 Linear。编辑器使用 `VISUAL`、`EDITOR` 或 `vi`，命令会显示实际模板路径。
+
+首次编辑或实际启动时，为项目初始化默认模板；修改或重新配置仓库绑定会保留其模板内容。模板必须包含 `{{issue_id}}`，例如：
 
 ```markdown
 请开发 Linear issue {{issue_id}}。
@@ -112,7 +129,7 @@ EDITOR=nano wtr prompt edit
 
 启动时按 issue 当前所属项目读取模板，自动附加 Linear workspace 上下文；提示词快照保存在执行批次中，编辑模板只影响之后的新批次。`--dry-run` 可预览最终参数，不创建模板文件。无项目的 issue 使用内置默认提示词。
 
-模板位置：`${XDG_CONFIG_HOME:-~/.config}/worktree-run/prompts/<workspace-id>/<project-id>.md`。删除项目绑定不会删除模板。
+模板位置：`${XDG_CONFIG_HOME:-~/.config}/worktree-run/prompts/<workspace-id>/<project-id>.md`。删除仓库绑定不会删除模板。
 
 已有的 `~/.config/worktree-run/prompt.md` 文件保持原样。若其中有需要沿用的内容，请通过 `wtr prompt edit <项目>` 打开目标项目模板，再将内容复制进去；新批次读取项目专属文件。
 
@@ -149,7 +166,7 @@ EDITOR=nano wtr prompt edit
 - `wtr runs` 和启动前会校验遗留 pane，将消失/异常退出的活动记录标记为 `interrupted`；仍存活的 pane 不重复启动。
 - 创建失败或后续失败保留 worktree/关联和错误记录。解决冲突后重试相同命令。异常退出若留下存活 pane，需先检查该 pane 再自行关闭，避免重复工作。
 - 无交互终端时不 attach；在 tmux 内切换当前客户端，在外部 attach。另一个 tmux server 中的窗口仅输出定位信息。
-- `--dry-run` 只读数据库，不写配置/模板，不 fetch、不创建分支、worktree、window 或运行记录、不执行 agent；缺少项目绑定时提示先配置；agent 可通过 `--agent NAME` 或默认值指定。
+- `--dry-run` 只读数据库，不写配置/模板，不 fetch、不创建分支、worktree、window 或运行记录、不执行 agent；没有匹配的仓库绑定或存在多条匹配时报告原因并停止；agent 可通过 `--agent NAME` 或默认值指定。
 
 Git 同步 hooks 完成后才启动 agent。宿主 Monitor 或 hooks 派生的**异步**环境初始化没有通用就绪协议，本版不会猜测就绪或自动等待。项目需确保环境同步准备完成；需要异步初始化的项目，应在启动 agent 前完成明确的 readiness 检查。
 

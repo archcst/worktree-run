@@ -30,10 +30,10 @@ class ProjectPromptTests(Sandbox):
             return self.cli("prompt", "edit", *args, cwd=cwd)
 
     def second_project(self, **values):
-        row = dict(self.binding, project_id="project-2", name="Second")
+        row = dict(self.binding, target_id="project-2", name="Second")
         row.update(values)
-        self.store.save_project(row)
-        return row
+        self.store.save_binding(row)
+        return dict(row, project_id=row["target_id"])
 
     def test_templates_are_isolated_by_workspace_and_project_id(self):
         first = prompt.initialize("ws-uuid", "project-1")
@@ -176,10 +176,11 @@ class ProjectPromptTests(Sandbox):
     def test_remove_and_rebind_preserves_project_template(self):
         path = prompt.initialize("ws-uuid", "project-1")
         path.write_text("Keep {{issue_id}}")
-        self.assertEqual(self.cli("project", "remove", "project-1").returncode, 0)
+        self.assertEqual(self.cli("binding", "remove", "project-1").returncode, 0)
         result = self.cli(
-            "project",
+            "binding",
             "add",
+            "--project",
             "project-1",
             "--baseline",
             "main",

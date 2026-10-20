@@ -7,8 +7,15 @@ from .util import Error, execute, require
 
 TERMINAL_STATE_TYPES = ("completed", "canceled", "duplicate")
 
-ISSUE_FIELDS = """id identifier title description priority createdAt
-    project { id name } state { name type } assignee { id }"""
+LABEL_FIELDS = "id name team { id name key }"
+LABEL_CONNECTION = "nodes { " + LABEL_FIELDS + " } pageInfo { hasNextPage endCursor }"
+ISSUE_FIELDS = (
+    """id identifier title description priority createdAt
+    project { id name } state { name type } assignee { id }
+    labels(first: 100) { """
+    + LABEL_CONNECTION
+    + " }"
+)
 
 
 class Linear:
@@ -84,6 +91,58 @@ class Linear:
             raise Error("Linear 项目响应缺少有效 ID/名称")
         return projects
 
+    def labels(self):
+        labels = self.pages(
+            "query($after: String) { issueLabels(first: 100, after: $after) { nodes { "
+            + LABEL_FIELDS
+            + " isGroup } pageInfo { hasNextPage endCursor } } }",
+            "issueLabels",
+        )
+        for label in labels:
+            self.validate_label(label)
+            if not isinstance(label.get("isGroup"), bool):
+                raise Error("Linear 标签响应缺少 isGroup")
+        return [label for label in labels if not label["isGroup"]]
+
+    @staticmethod
+    def validate_label(label):
+        if not isinstance(label, dict) or not all(
+            isinstance(label.get(k), str) and label[k] for k in ("id", "name")
+        ):
+            raise Error("Linear 标签响应缺少有效 ID/名称")
+        team = label.get("team")
+        if team is not None and (
+            not isinstance(team, dict)
+            or not all(isinstance(team.get(k), str) and team[k] for k in ("id", "name", "key"))
+        ):
+            raise Error("Linear 标签的团队信息无效")
+
+    def complete_labels(self, issue):
+        connection = issue.get("labels")
+        labels, seen = [], set()
+        while True:
+            if not isinstance(connection, dict) or not isinstance(connection.get("nodes"), list):
+                raise Error("Linear issue 标签响应结构不正确")
+            for label in connection["nodes"]:
+                self.validate_label(label)
+            labels.extend(connection["nodes"])
+            info = connection.get("pageInfo")
+            if not isinstance(info, dict) or not isinstance(info.get("hasNextPage"), bool):
+                raise Error("Linear issue 标签分页信息无效")
+            if not info["hasNextPage"]:
+                return dict(nodes=labels, pageInfo=info)
+            cursor = info.get("endCursor")
+            if not isinstance(cursor, str) or not cursor or cursor in seen:
+                raise Error("Linear issue 标签返回重复或缺失的分页游标")
+            seen.add(cursor)
+            data = self.query(
+                "query($id: String!, $after: String) { issue(id: $id) { "
+                "labels(first: 100, after: $after) { " + LABEL_CONNECTION + " } } }",
+                {"id": issue["id"], "after": cursor},
+            )
+            parent = data.get("issue")
+            connection = parent.get("labels") if isinstance(parent, dict) else None
+
     def mine(self):
         issues = self.pages(
             """query($after: String, $closedTypes: [String!]!) {
@@ -138,4 +197,4 @@ class Linear:
                 not isinstance(value, dict) or not isinstance(value.get("id"), str)
             ):
                 raise Error(f"Linear issue 的 {field} 字段无效")
-        return issue
+        return dict(issue, labels=self.complete_labels(issue))

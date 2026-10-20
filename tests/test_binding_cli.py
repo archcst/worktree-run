@@ -10,15 +10,16 @@ from worktree_run.tmux import Tmux
 from worktree_run.worktree import git
 
 
-class ProjectAddTests(Sandbox):
+class BindingAddTests(Sandbox):
     def setUp(self):
         super().setUp()
-        self.store.write("DELETE FROM projects")
+        self.store.write("DELETE FROM bindings")
 
     def add(self, cwd):
         return self.cli(
-            "project",
+            "binding",
             "add",
+            "--project",
             "project-1",
             "--baseline",
             "main",
@@ -36,7 +37,7 @@ class ProjectAddTests(Sandbox):
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn("main worktree", result.stderr)
         self.assertNotIn("Linear unavailable", result.stderr)
-        self.assertEqual(self.store.all("SELECT * FROM projects"), [])
+        self.assertEqual(self.store.bindings(), [])
         return result
 
     def test_binds_current_main_root_without_path_prompt(self):
@@ -44,7 +45,7 @@ class ProjectAddTests(Sandbox):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["repo"], str(self.repo.resolve()))
         self.assertEqual(
-            self.store.project("ws-uuid", "project-1")["repo"], str(self.repo.resolve())
+            self.store.binding("ws-uuid", "project", "project-1")["repo"], str(self.repo.resolve())
         )
 
     def test_rejects_subdirectory_with_main_root_hint(self):
@@ -86,10 +87,10 @@ class ProjectAddTests(Sandbox):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_repo_flag_cannot_override_current_directory(self):
-        result = self.cli("project", "add", "project-1", "--repo", str(self.repo))
+        result = self.cli("binding", "add", "--project", "project-1", "--repo", str(self.repo))
         self.assertEqual(result.returncode, 2)
         self.assertIn("--repo", result.stderr)
-        self.assertEqual(self.store.all("SELECT * FROM projects"), [])
+        self.assertEqual(self.store.bindings(), [])
 
     def root_prompt(self, *, action="add", expected=None):
         expected = expected or str(self.repo.resolve())
@@ -99,8 +100,9 @@ class ProjectAddTests(Sandbox):
             "worktree_run",
             "--db",
             str(self.store.path),
-            "project",
+            "binding",
             action,
+            *(["--project"] if action == "add" else []),
             "project-1",
             "--baseline",
             "main",
@@ -131,7 +133,7 @@ class ProjectAddTests(Sandbox):
     def test_root_prefill_can_be_accepted_with_enter(self):
         tmux, pane, expected = self.root_prompt()
         tmux.call("send-keys", "-t", pane, "Enter")
-        binding = self.wait_for(lambda: self.store.project("ws-uuid", "project-1"))
+        binding = self.wait_for(lambda: self.store.binding("ws-uuid", "project", "project-1"))
         self.assertEqual(binding["root"], expected)
         self.assertEqual(self.store.all("SELECT * FROM issues"), [])
 
@@ -140,11 +142,11 @@ class ProjectAddTests(Sandbox):
         tmux.call("send-keys", "-t", pane, "BSpace")
         tmux.call("send-keys", "-l", "-t", pane, "--", "-中文 custom")
         tmux.call("send-keys", "-t", pane, "Enter")
-        binding = self.wait_for(lambda: self.store.project("ws-uuid", "project-1"))
+        binding = self.wait_for(lambda: self.store.binding("ws-uuid", "project", "project-1"))
         self.assertEqual(binding["root"], expected[:-1] + "-中文 custom")
 
     def test_edit_prefills_saved_root(self):
-        self.store.save_project(self.binding)
+        self.store.save_binding(self.binding)
         tmux, pane, _ = self.root_prompt(action="edit", expected=self.binding["root"])
         tmux.call("send-keys", "-t", pane, "Enter")
         self.wait_for(
@@ -153,7 +155,8 @@ class ProjectAddTests(Sandbox):
             )
         )
         self.assertEqual(
-            self.store.project("ws-uuid", "project-1")["root"], str(self.base.resolve() / "trees")
+            self.store.binding("ws-uuid", "project", "project-1")["root"],
+            str(self.base.resolve() / "trees"),
         )
 
     def test_cancel_root_prompt_does_not_bind_project(self):
@@ -164,7 +167,7 @@ class ProjectAddTests(Sandbox):
                 tmux.call("display-message", "-p", "-t", pane, "#{pane_dead}").stdout.strip() == "1"
             )
         )
-        self.assertEqual(self.store.all("SELECT * FROM projects"), [])
+        self.assertEqual(self.store.bindings(), [])
 
     def test_editable_prompt_passes_default_and_returns_edited_path(self):
         default = str(self.repo.resolve())
@@ -178,7 +181,7 @@ class ProjectAddTests(Sandbox):
     def test_edit_remains_available_from_other_directories(self):
         self.assertEqual(self.add(self.repo).returncode, 0)
         result = self.cli(
-            "project",
+            "binding",
             "edit",
             "project-1",
             "--repo",

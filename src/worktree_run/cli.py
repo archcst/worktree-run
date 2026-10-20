@@ -10,13 +10,13 @@ import sys
 import tempfile
 from pathlib import Path
 
-from . import __version__, agents, config, prompt, runner, worktree
+from . import __version__, agents, bindings, config, prompt, runner, worktree
 from .linear import Linear
 from .store import Store
 from .tmux import Tmux
 from .util import Error, clean, require
 
-COMMANDS = {"start", "project", "agent", "config", "prompt", "runs", "_run"}
+COMMANDS = {"start", "binding", "agent", "config", "prompt", "runs", "_run"}
 
 
 def ask(label, default=None, *, editable=False):
@@ -50,7 +50,11 @@ def choose(rows, label):
     answer = ask("输入序号或完整名称/ID")
     if answer.isdigit() and 1 <= int(answer) <= len(rows):
         return rows[int(answer) - 1]
-    matches = [r for r in rows if answer in (r.get("name"), r.get("project_id"), r.get("id"))]
+    matches = [
+        r
+        for r in rows
+        if answer in (r.get("name"), r.get("project_id"), r.get("target_id"), r.get("id"))
+    ]
     if len(matches) != 1:
         raise Error("选择不唯一或不存在，请使用序号/ID")
     return matches[0]
@@ -119,8 +123,9 @@ def select_issue(issues):
 
 def binding_values(args, previous=None, *, repo=None):
     previous = previous or {}
-    repo = worktree.repository(
-        repo or getattr(args, "repo", None) or ask("main worktree 绝对路径", previous.get("repo"))
+    repo = worktree.main_repository(
+        repo or getattr(args, "repo", None) or ask("main worktree 绝对路径", previous.get("repo")),
+        command="wtr binding add",
     )
     baseline = args.baseline or ask("新分支基线", previous.get("baseline", "origin/main"))
     worktree.verify_baseline(repo, baseline)
@@ -141,67 +146,116 @@ def binding_values(args, previous=None, *, repo=None):
 
 def select_local(rows, name):
     if name:
-        matches = [r for r in rows if name in (r.get("name"), r.get("project_id"))]
+        matches = [
+            r for r in rows if name in (r.get("name"), r.get("project_id"), r.get("target_id"))
+        ]
         if len(matches) != 1:
             raise Error("记录不存在或名称重复；请使用明确 ID")
         return matches[0]
     return choose(
-        rows, lambda r: f"{r.get('name')} {r.get('workspace_slug', '')} {r.get('project_id', '')}"
+        rows,
+        lambda r: (
+            bindings.describe(r)
+            if "kind" in r
+            else f"{r.get('name')} {r.get('workspace_slug', '')} {r.get('project_id', '')}"
+        ),
     )
 
 
-def project_command(store, args):
+def remote_target(linear, kind, name=None):
+    rows = linear.projects() if kind == "project" else linear.labels()
+    if name:
+        matches = [row for row in rows if name in (row["id"], row["name"])]
+        if len(matches) != 1:
+            details = "; ".join(bindings.target_text(kind, row) for row in matches)
+            raise Error(f"Linear {bindings.KINDS[kind]} 不存在或重名，请使用明确 ID。{details}")
+        return matches[0]
+    return choose(rows, lambda row: bindings.target_text(kind, row))
+
+
+def binding_command(store, args):
     repo = worktree.main_repository(Path.cwd()) if args.action == "add" else None
-    rows = store.all("SELECT * FROM projects ORDER BY workspace_slug,name")
-    if args.workspace:
-        rows = [r for r in rows if r["workspace_slug"] == args.workspace]
+    rows = store.bindings(args.workspace)
     if args.action == "list":
         output(rows)
         return
     if args.action == "add":
-        linear = Linear(args.workspace)
-        projects = linear.projects()
-        if args.name:
-            matches = [p for p in projects if args.name in (p["id"], p["name"])]
-            if len(matches) != 1:
-                raise Error("Linear 项目不存在或重名，请使用 project ID")
-            project = matches[0]
+        if args.project is not None:
+            kind, name = "project", args.project
+        elif args.label is not None:
+            kind, name = "label", args.label
         else:
-            project = choose(projects, lambda p: f"{p['name']} [{p['id']}]")
-        if store.project(linear.workspace, project["id"]):
-            raise Error("项目已绑定，请使用 wtr project edit")
+            kind = choose(
+                [dict(id=k, name=v) for k, v in bindings.KINDS.items()], lambda r: r["name"]
+            )["id"]
+            name = None
+        linear = Linear(args.workspace)
+        target = remote_target(linear, kind, name)
+        row = bindings.from_target(linear, kind, target, {})
+        if store.binding(*bindings.key(row)):
+            raise Error("该对象已绑定，请使用 wtr binding edit")
+    else:
+        rows = [r for r in rows if not args.kind or r["kind"] == args.kind]
+        row = select_local(rows, args.name)
+    if args.action == "remove":
+        store.remove_binding(*bindings.key(row))
+        return
+    previous = dict(row)
+    changing_target = args.action == "edit" and (args.project is not None or args.label is not None)
+    if changing_target:
+        kind, name = (
+            ("project", args.project) if args.project is not None else ("label", args.label)
+        )
+        linear = Linear(row["workspace_slug"])
+        if linear.workspace != row["workspace"]:
+            raise Error("Linear workspace 与原绑定不一致，未修改绑定")
+        target = remote_target(linear, kind, name)
+        row = bindings.from_target(
+            linear, kind, target, {field: row[field] for field in ("repo", "baseline", "root")}
+        )
+        if args.repo or args.baseline or args.root:
+            values = argparse.Namespace(
+                **{
+                    field: getattr(args, field) or row[field]
+                    for field in ("repo", "baseline", "root")
+                }
+            )
+            row.update(binding_values(values))
+    else:
+        row.update(binding_values(args, row, repo=repo))
+    if args.action == "edit":
+        store.replace_binding(previous, row)
+    else:
+        store.save_binding(row)
+    output(row)
+
+
+def prompt_project(store, args):
+    rows = store.projects(args.workspace)
+    if args.project:
+        matches = [r for r in rows if args.project in (r["name"], r["project_id"])]
+        if matches:
+            return select_local(rows, args.project)
+    if args.project or not rows:
+        linear = Linear(args.workspace)
+        project = remote_target(linear, "project", args.project)
         row = dict(
             workspace=linear.workspace,
             workspace_slug=linear.slug,
             project_id=project["id"],
             name=project["name"],
         )
-    else:
-        row = select_local(rows, args.name)
-    if args.action == "remove":
-        store.write(
-            "DELETE FROM projects WHERE workspace=? AND project_id=?",
-            (row["workspace"], row["project_id"]),
-        )
-        return
-    row.update(binding_values(args, row, repo=repo))
-    prompt.initialize(row["workspace"], row["project_id"])
-    store.save_project(row)
-    output(row)
-
-
-def prompt_project(store, args):
-    rows = store.all("SELECT * FROM projects ORDER BY workspace_slug,name")
-    if args.workspace:
-        rows = [row for row in rows if row["workspace_slug"] == args.workspace]
-    if not rows:
-        raise Error("尚未绑定项目；请先在 main worktree 根目录运行 wtr project add")
-    if args.project:
-        return select_local(rows, args.project)
+        with store.lock():
+            store.save_project(row)
+        return row
 
     cwd = Path.cwd().resolve()
     by_id = {(row["workspace"], row["project_id"]): row for row in rows}
-    locations = [(Path(row["repo"]).resolve(), row) for row in rows]
+    locations = [
+        (Path(binding["repo"]).resolve(), by_id.get((binding["workspace"], binding["target_id"])))
+        for binding in store.bindings(args.workspace)
+        if binding["kind"] == "project"
+    ]
     for issue in store.all("SELECT * FROM issues"):
         if args.workspace and issue["workspace_slug"] != args.workspace:
             continue
@@ -216,7 +270,7 @@ def prompt_project(store, args):
         depth = max(length for length, _ in matches)
         candidates = [row for length, row in matches if length == depth]
         if any(row is None for row in candidates):
-            raise Error("当前 issue 没有已绑定的项目；请显式指定 wtr prompt edit <项目名称或ID>")
+            raise Error("当前 issue 没有可用的项目记录；请显式指定 wtr prompt edit <项目名称或ID>")
         rows = list({(row["workspace"], row["project_id"]): row for row in candidates}.values())
         if len(rows) == 1:
             return rows[0]
@@ -235,25 +289,35 @@ def resolve_binding(store, linear, issue, dry_run):
     previous = store.issue(linear.workspace, issue["id"])
     if previous:
         return previous
+    matches = bindings.matching(store, linear.workspace, issue)
+    if len(matches) == 1:
+        return matches[0]
+    if matches:
+        if dry_run or not sys.stdin.isatty():
+            details = "\n".join(bindings.describe(row) for row in matches)
+            raise Error(f"issue 命中多个仓库绑定，请在交互终端明确选择：\n{details}")
+        print("issue 命中多个仓库绑定，请选择本次使用的一项：")
+        return choose(matches, bindings.describe)
     project = issue.get("project")
-    binding = store.project(linear.workspace, project["id"]) if project else None
-    if binding:
-        return binding
-    if dry_run:
-        raise Error("issue 无关联且项目未绑定；请先运行 wtr project add 或在交互模式选择仓库")
-    print("该 issue 没有项目绑定，请选择本次使用的仓库。")
-    binding = binding_values(argparse.Namespace(repo=None, baseline=None, root=None))
-    if project and ask("保存为该项目的持久绑定？y/N", "N").lower() == "y":
-        store.save_project(
-            dict(
-                binding,
-                workspace=linear.workspace,
-                workspace_slug=linear.slug,
-                project_id=project["id"],
-                name=project["name"],
-            )
-        )
-    return binding
+    labels = issue["labels"]["nodes"]
+    details = (
+        f"Project: {project['name'] if project else '无'}；"
+        f"Labels: {', '.join(label['name'] for label in labels) or '无'}"
+    )
+    message = f"issue 未匹配仓库绑定（{details}）；请运行 wtr config 配置「仓库绑定」"
+    if dry_run or not sys.stdin.isatty():
+        raise Error(message)
+    candidates = []
+    if project:
+        candidates.append(bindings.from_target(linear, "project", project, {}))
+    candidates.extend(bindings.from_target(linear, "label", label, {}) for label in labels)
+    if not candidates:
+        raise Error(message + "；请先为 issue 指定 Project 或 Label")
+    print(clean(message) + "，或选择下列对象立即创建绑定：")
+    row = choose(candidates, bindings.describe)
+    row.update(binding_values(argparse.Namespace(repo=None, baseline=None, root=None)))
+    store.save_binding(row)
+    return row
 
 
 def selected_agent(store, override):
@@ -343,7 +407,9 @@ def parser():
     )
     start_p.add_argument("--dry-run", action="store_true")
     start_p.add_argument("--no-attach", action="store_true", help="仅创建后台窗口")
-    group = subs.add_parser("project").add_subparsers(dest="action", required=True)
+    group = subs.add_parser("binding", help="管理 Project/Label 仓库绑定").add_subparsers(
+        dest="action", required=True
+    )
     for action in ("add", "list", "edit", "remove"):
         item = group.add_parser(
             action,
@@ -353,7 +419,13 @@ def parser():
         )
         if action == "list":
             continue
-        item.add_argument("name", nargs="?", help="名称或 project ID")
+        if action != "add":
+            item.add_argument("name", nargs="?", help="当前匹配对象的完整名称或 ID")
+            item.add_argument("--kind", choices=bindings.KINDS, help="筛选当前绑定类型")
+        if action in ("add", "edit"):
+            target = item.add_mutually_exclusive_group()
+            target.add_argument("--project", help="目标 Project 的完整名称或 ID")
+            target.add_argument("--label", help="目标 Label 的完整名称或 ID")
         if action in ("add", "edit"):
             if action == "edit":
                 item.add_argument("--repo")
@@ -364,7 +436,7 @@ def parser():
     )
     group = subs.add_parser(
         "config",
-        help="打开交互配置菜单（项目、提示词、默认 agent、tmux）",
+        help="打开交互配置菜单（仓库绑定、项目提示词、默认 agent、tmux）",
         description="不带子命令时打开交互配置菜单；list/set 用于脚本和快捷操作。",
     ).add_subparsers(dest="action")
     group.add_parser("list")
@@ -374,7 +446,7 @@ def parser():
     prompt_p = subs.add_parser("prompt", help="编辑项目专属提示词")
     prompt_p.add_argument("action", choices=["edit"])
     prompt_p.add_argument(
-        "project", nargs="?", help="绑定项目的名称或ID；默认按当前目录识别，否则选择项目"
+        "project", nargs="?", help="项目名称或ID；默认按当前目录识别，否则选择项目"
     )
     subs.add_parser("runs", help="查看历史，并恢复遗留执行状态")
     internal = subs.add_parser("_run", help="内部执行入口（仅由 tmux 调用）")
@@ -404,9 +476,9 @@ def main(argv=None):
             return runner.internal_run(store, args.run_id)
         elif args.command == "agent":
             output(agents.catalog(store.setting("agent")))
-        elif args.command == "project":
+        elif args.command == "binding":
             with store.lock():
-                project_command(store, args)
+                binding_command(store, args)
         elif args.command == "config":
             if args.action is None:
                 from .config_ui import run as configure

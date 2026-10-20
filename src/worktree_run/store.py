@@ -13,10 +13,15 @@ from .util import Error
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS projects (
+CREATE TABLE IF NOT EXISTS bindings (
+ workspace TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('project','label')),
+ target_id TEXT NOT NULL, name TEXT NOT NULL, workspace_slug TEXT NOT NULL,
+ team_name TEXT NOT NULL, repo TEXT NOT NULL, baseline TEXT NOT NULL, root TEXT NOT NULL,
+ PRIMARY KEY(workspace, kind, target_id)
+);
+CREATE TABLE IF NOT EXISTS prompt_projects (
  workspace TEXT NOT NULL, project_id TEXT NOT NULL, name TEXT NOT NULL,
- workspace_slug TEXT NOT NULL, repo TEXT NOT NULL, baseline TEXT NOT NULL,
- root TEXT NOT NULL, PRIMARY KEY(workspace, project_id)
+ workspace_slug TEXT NOT NULL, PRIMARY KEY(workspace, project_id)
 );
 CREATE TABLE IF NOT EXISTS issues (
  workspace TEXT NOT NULL, issue_id TEXT NOT NULL, identifier TEXT NOT NULL,
@@ -35,7 +40,7 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS active_issue ON runs(workspace, issue_id)
  WHERE status IN ('preparing','running');
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
 """
 
 
@@ -62,8 +67,11 @@ class Store:
             self.db = sqlite3.connect(":memory:" if readonly else self.path, timeout=30)
         self.db.row_factory = sqlite3.Row
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
-        if version > 1:
-            raise Error("数据库版本高于当前 wtr，请升级")
+        if version > 2 or (readonly and self.path.exists() and version < 2):
+            self.db.close()
+            if version > 2:
+                raise Error("数据库版本高于当前 wtr，请升级")
+            raise Error("请先运行 wtr config 配置仓库绑定，再使用只读预览")
         if not readonly or not self.path.exists():
             self.db.executescript(SCHEMA)
             self.db.commit()
@@ -109,16 +117,87 @@ class Store:
             (key, value),
         )
 
+    def bindings(self, workspace=None):
+        return self.all(
+            "SELECT * FROM bindings WHERE (? IS NULL OR workspace_slug=?) "
+            "ORDER BY workspace_slug,kind,name,target_id",
+            (workspace, workspace),
+        )
+
+    def binding(self, workspace, kind, target_id):
+        return self.one(
+            "SELECT * FROM bindings WHERE workspace=? AND kind=? AND target_id=?",
+            (workspace, kind, target_id),
+        )
+
+    def save_binding(self, row):
+        self.write(
+            """INSERT INTO bindings
+            (workspace,kind,target_id,name,workspace_slug,team_name,repo,baseline,root)
+            VALUES (:workspace,:kind,:target_id,:name,:workspace_slug,:team_name,:repo,:baseline,:root)
+            ON CONFLICT(workspace,kind,target_id) DO UPDATE SET name=excluded.name,
+            workspace_slug=excluded.workspace_slug,team_name=excluded.team_name,
+            repo=excluded.repo,baseline=excluded.baseline,root=excluded.root""",
+            row,
+        )
+        if row["kind"] == "project":
+            self.save_project(dict(row, project_id=row["target_id"]))
+
+    def replace_binding(self, previous, row):
+        """Replace a binding atomically after the caller's interactive work is complete."""
+        if self.readonly:
+            raise Error("只读模式不能修改数据库")
+        if previous["workspace"] != row["workspace"]:
+            raise Error("不能将仓库绑定移到其他 workspace")
+        old_key = (previous["workspace"], previous["kind"], previous["target_id"])
+        new_key = (row["workspace"], row["kind"], row["target_id"])
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            if self.binding(*old_key) != previous:
+                raise Error("仓库绑定已被其他进程修改，请重新选择后再保存")
+            if new_key != old_key and self.binding(*new_key):
+                raise Error("目标 Project/Label 已被其他绑定占用，未修改原绑定")
+            self.db.execute(
+                """UPDATE bindings SET kind=:kind,target_id=:target_id,name=:name,
+                workspace_slug=:workspace_slug,team_name=:team_name,repo=:repo,
+                baseline=:baseline,root=:root
+                WHERE workspace=:workspace AND kind=:old_kind AND target_id=:old_target_id""",
+                dict(row, old_kind=previous["kind"], old_target_id=previous["target_id"]),
+            )
+            if row["kind"] == "project":
+                self.db.execute(
+                    """INSERT INTO prompt_projects (workspace,project_id,name,workspace_slug)
+                    VALUES (:workspace,:target_id,:name,:workspace_slug)
+                    ON CONFLICT(workspace,project_id) DO UPDATE SET name=excluded.name,
+                    workspace_slug=excluded.workspace_slug""",
+                    row,
+                )
+
+    def remove_binding(self, workspace, kind, target_id):
+        self.write(
+            "DELETE FROM bindings WHERE workspace=? AND kind=? AND target_id=?",
+            (workspace, kind, target_id),
+        )
+
+    def projects(self, workspace=None):
+        return self.all(
+            "SELECT * FROM prompt_projects WHERE (? IS NULL OR workspace_slug=?) "
+            "ORDER BY workspace_slug,name",
+            (workspace, workspace),
+        )
+
     def project(self, workspace, project_id):
         return self.one(
-            "SELECT * FROM projects WHERE workspace=? AND project_id=?", (workspace, project_id)
+            "SELECT * FROM prompt_projects WHERE workspace=? AND project_id=?",
+            (workspace, project_id),
         )
 
     def save_project(self, row):
         self.write(
-            """INSERT INTO projects VALUES (:workspace,:project_id,:name,:workspace_slug,:repo,:baseline,:root)
+            """INSERT INTO prompt_projects (workspace,project_id,name,workspace_slug)
+            VALUES (:workspace,:project_id,:name,:workspace_slug)
             ON CONFLICT(workspace,project_id) DO UPDATE SET name=excluded.name,
-            workspace_slug=excluded.workspace_slug,repo=excluded.repo,baseline=excluded.baseline,root=excluded.root""",
+            workspace_slug=excluded.workspace_slug""",
             row,
         )
 

@@ -208,12 +208,13 @@ class CoreTests(Sandbox):
         self.assertEqual(self.cli("config", "set", "agent", "unknown").returncode, 1)
         self.assertEqual(self.store.setting("agent"), "pi")
         self.assertEqual(self.cli("config", "set", "tmux-session", "invalid:name").returncode, 1)
-        self.assertEqual(self.cli("project", "remove", "project-1").returncode, 0)
+        self.assertEqual(self.cli("binding", "remove", "project-1").returncode, 0)
         self.assertTrue(self.repo.exists())
         self.assertEqual(
             self.cli(
-                "project",
+                "binding",
                 "add",
+                "--project",
                 "project-1",
                 "--baseline",
                 "main",
@@ -255,28 +256,20 @@ class CoreTests(Sandbox):
         worktree.prepare(row, associated=False)
         run_id = self.store.new_run(row, "pi", ["pi", "prompt"], None)
         self.store.update_run(run_id, status="failed")
-        self.assertEqual(self.cli("project", "remove", "project-1").returncode, 0)
+        self.assertEqual(self.cli("binding", "remove", "project-1").returncode, 0)
         self.assertEqual(self.cli("config", "set", "agent", "codex").returncode, 0)
         self.assertEqual(self.store.run(run_id)["agent"], "pi")
         self.assertEqual(worktree.inspect(row, associated=True), "reuse")
 
-    def test_no_project_fallback_is_not_persisted(self):
+    def test_issue_without_match_guides_configuration_without_writes(self):
         from worktree_run.cli import resolve_binding
 
         issue = dict(ISSUE, project=None)
-        with (
-            patch(
-                "worktree_run.cli.binding_values",
-                return_value={k: self.binding[k] for k in ("repo", "baseline", "root")},
-            ),
-            patch("worktree_run.cli.ask") as ask,
-        ):
-            binding = resolve_binding(self.store, self.context(), issue, False)
-            ask.assert_not_called()
-        self.assertEqual(binding["repo"], str(self.repo))
-        self.assertEqual(len(self.store.all("SELECT * FROM projects")), 1)
-        with self.assertRaisesRegex(Error, "未绑定"):
-            resolve_binding(self.store, self.context(), issue, True)
+        before = self.store.path.read_bytes()
+        for dry_run in (False, True):
+            with self.subTest(dry_run=dry_run), self.assertRaisesRegex(Error, "未匹配仓库绑定"):
+                resolve_binding(self.store, self.context(), issue, dry_run)
+        self.assertEqual(self.store.path.read_bytes(), before)
 
     def test_failed_preparation_is_recorded(self):
         self.install_agent()

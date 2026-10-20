@@ -40,7 +40,7 @@ def worktrees(repo):
     return trees
 
 
-def main_repository(path, *, command="wtr project add"):
+def main_repository(path, *, command="wtr binding add"):
     """Require the root of Git's primary (not linked) worktree, on any branch."""
     require("git")
     repo = Path(path).expanduser().resolve()

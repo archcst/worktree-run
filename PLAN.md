@@ -4,7 +4,7 @@ CLI 命令：`wtr`
 
 ## 目标
 
-从 Linear 中选择分配给自己的 issue，根据其项目路由到本地仓库，创建或复用独立 worktree，并在统一 tmux session 的 issue 专属 window 中启动 CLI coding agent，携带包含 issue ID 的初始提示词开始开发。
+从 Linear 中选择分配给自己的 issue，根据配置的 Project 或 Label 绑定路由到本地仓库，创建或复用独立 worktree，并在统一 tmux session 的 issue 专属 window 中启动 CLI coding agent，携带包含 issue ID 的初始提示词开始开发。
 
 未来支持自动轮询分配给自己的 issue，复用同一套任务准备和执行逻辑。
 
@@ -26,7 +26,7 @@ CLI 命令：`wtr`
 1. 检查本次运行需要的依赖和配置。
 2. 通过 Linear CLI 查询分配给当前用户的未完成 issues，或读取指定 issue。
 3. 使用 fzf 搜索选择，显示 issue ID、标题、项目、状态和优先级，并提供描述预览。
-4. 根据 workspace 和 project ID 查找本地项目绑定。
+4. 复用已有 issue 关联，或按 workspace、绑定类型和对象 ID 匹配仓库；多条匹配时明确选择。
 5. 校验仓库、基线和目标路径，创建或复用 issue worktree。
 6. 将提示词模板中的 `{{issue_id}}` 替换为 Linear issue identifier，例如 `ENG-123`。
 7. 在统一 tmux session 中创建或定位该 issue 的 window。
@@ -35,21 +35,22 @@ CLI 命令：`wtr`
 
 手动按 ID 启动允许明确指定可访问的 issue；交互列表和未来轮询默认限定为分配给自己的 issue。
 
-## 项目路由和 worktree
+## 仓库路由和 worktree
 
-### 项目绑定
+### 仓库绑定
 
-通过 `wtr config` 的项目管理菜单配置并保存在 SQLite，参数化项目命令用于脚本和快捷操作：
+通过 `wtr config` 的仓库绑定菜单配置并保存在 SQLite，`wtr binding` 用于脚本和快捷操作：
 
 - Linear workspace 身份。
-- Linear project ID 和显示名称。
+- 匹配类型：Project 或 Label，每条绑定只能选一种。
+- 对应对象的 ID、完整显示名称，以及 Label 的团队作用域。
 - 本地 main worktree 绝对路径。
 - 新分支基线，例如 `origin/main`。
 - issue worktree 根目录。
 
-按项目名称选择绑定，内部使用 workspace + project ID 定位，避免重名和改名问题。
+按完整名称或 ID 选择对象，内部使用 workspace + 类型 + 对象 ID 定位；同名对象需明确选择。已有绑定支持直接修改匹配方式或对象，保留仓库设置，在确认后原子更新；目标占用或并发修改时拒绝覆盖。Label 如 `repo:imh-hub`，其内容仅作为匹配对象，不作为路径或命令。
 
-未绑定或没有项目的 issue：手动模式引导选择仓库；仅对有项目的 issue 提供持久化项目绑定。自动模式跳过并记录原因。
+已有 issue 关联始终复用原仓库。新 issue 检查其 Project 和全部 Labels，恰好命中一条时自动使用；命中多条时交互选择，不按类型设置优先级。未命中时引导配置，可在交互启动中从 issue 的对象创建绑定。非交互和只读预览遇到缺失或歧义时报告原因并停止。
 
 ### 创建与复用
 
@@ -66,7 +67,7 @@ CLI 命令：`wtr`
 
 ## 配置与存储
 
-`wtr config` 提供统一的交互配置入口，包括项目管理、项目提示词、默认 agent、tmux session、工作区筛选和配置概览。支持方向键、Emacs（Ctrl+n/p、Alt+</>、Ctrl+g）和 Vim（j/k、gg/G、q）菜单导航，Enter 确认。项目列表按 / 进入搜索模式，Esc/Ctrl+g 返回导航并保留筛选；支持预填输入、取消和返回。修改确认后即时保存，解除绑定需再次确认；菜单和外部编辑器等待期间不持有任务启动锁。
+`wtr config` 提供统一的交互配置入口，包括仓库绑定、项目提示词、默认 agent、tmux session、工作区筛选和配置概览。支持方向键、Emacs（Ctrl+n/p、Alt+</>、Ctrl+g）和 Vim（j/k、gg/G、q）菜单导航，Enter 确认。绑定和项目列表按 / 进入搜索模式，Esc/Ctrl+g 返回导航并保留筛选；支持预填输入、取消和返回。修改确认后即时保存，解除绑定需再次确认；菜单和外部编辑器等待期间不持有任务启动锁。
 
 配置和执行记录存入 SQLite；保留 `wtr config list/set` 等参数化命令供脚本使用。工作区筛选只影响本次配置操作范围。
 
@@ -79,7 +80,8 @@ CLI 命令：`wtr`
 
 ### 逻辑数据
 
-- `projects`：项目与仓库的绑定。
+- `bindings`：以 workspace、类型和对象 ID 定位的仓库绑定。
+- `prompt_projects`：独立的提示词项目身份缓存，不包含仓库配置。
 - `settings`：默认 agent、tmux session 名称；未来增加轮询设置。
 - 内置 agent 适配器：名称与交互启动命令由程序维护；SQLite 仅保存默认名称和各执行批次的实际参数。
 - `issues`：workspace、issue ID/identifier、项目、仓库、分支、worktree 关联。
@@ -91,7 +93,7 @@ Linear 认证复用 Linear CLI。配置初始化和数据库变更需要保持�
 
 ## 提示词模板
 
-每个 Linear 项目使用独立的 Markdown 模板，以 workspace ID + project ID 定位。新建绑定、首次编辑或实际启动时初始化默认模板。通过 `wtr prompt edit` 使用用户编辑器修改当前目录对应的项目模板，也可用 `wtr prompt edit <项目名称或ID>` 显式选择。一个仓库绑定多个项目时需要选择，项目改名不影响模板关联。
+每个 Linear 项目使用独立的 Markdown 模板，以 workspace ID + project ID 定位。首次编辑或实际启动时初始化默认模板；项目提示词可以独立于仓库绑定进行管理。通过 `wtr prompt edit` 使用用户编辑器修改当前目录对应的项目模板，也可用 `wtr prompt edit <项目名称或ID>` 显式选择。一个仓库绑定多个项目时需要选择，项目改名不影响模板关联。
 
 ```markdown
 请开发 Linear issue {{issue_id}}。
@@ -161,10 +163,13 @@ wtr ENG-123                 # 启动指定 issue
 wtr ENG-123 --agent opencode # 单次选择 agent
 wtr --dry-run               # 预览路由、worktree 和启动计划，不执行创建
 
-wtr project add             # 交互绑定 Linear 项目和仓库
-wtr project list
-wtr project edit
-wtr project remove
+wtr binding add             # 选择 Project 或 Label，再配置当前仓库
+wtr binding add --label 'repo:my-app'
+wtr binding add --project PROJECT_ID
+wtr binding list
+wtr binding edit LABEL_ID --kind label
+wtr binding edit PROJECT_ID --kind project --label 'repo:my-app'
+wtr binding remove LABEL_ID --kind label
 
 wtr agent list              # 查看内置 agent、安装状态和默认值
 wtr ENG-123 --agent          # 本次交互选择已安装的 agent
@@ -177,7 +182,7 @@ wtr prompt edit PROJECT_ID  # 显式选择项目
 wtr runs
 ```
 
-首次缺少项目绑定时提供交互引导，未设置默认 agent 时提供选择菜单。删除项目配置或修改默认 agent 不删除 worktree 或历史执行记录。
+首次缺少仓库绑定时提供交互引导，未设置默认 agent 时提供选择菜单。删除仓库绑定或修改默认 agent 不删除 worktree 或历史执行记录。
 
 未来增加：
 
@@ -192,7 +197,7 @@ wtr retry ENG-123           # 显式重新入队，具体接口后续确定
 ### 接单范围
 
 - 仅处理分配给当前 Linear 用户的 issue。
-- 必须属于已绑定项目并满足配置的待办状态。
+- 必须有唯一可用的仓库绑定并满足配置的待办状态。
 - 可选要求 `agent-ready` 标签。
 - 优先级高的先执行，同优先级按创建时间；正确处理 Linear 的“无优先级”值。
 - 初始并发为 1。
@@ -244,7 +249,7 @@ tests/            # 测试
 
 1. 验证本机 Linear CLI 的结构化输出、分页、当前用户、项目和 issue 查询接口。
 2. 建立 Python 包、`wtr` 入口和 SQLite 最小表结构。
-3. 实现统一配置菜单：项目绑定、内置 agent 选择与默认值、项目提示词编辑及 tmux 设置。
+3. 实现统一配置菜单：Project/Label 仓库绑定、内置 agent 选择与默认值、项目提示词编辑及 tmux 设置。
 4. 实现 issue 列表和 fzf 选择。
 5. 实现 worktree 创建、校验与复用。
 6. 实现 tmux session/window 和 agent 启动、退出记录。
@@ -260,7 +265,7 @@ tests/            # 测试
 
 ## 测试与验收
 
-- 单元测试覆盖项目路由、模板替换、参数边界、状态转换及去重。
+- 单元测试覆盖 Project/Label 路由、多条匹配、标签分页、模板替换、参数边界、状态转换及去重。
 - 临时 Git 仓库覆盖创建、复用、路径占用、已有分支、基线失效和工作区有未提交内容的情况。
 - 假 Linear/agent 可执行文件覆盖错误退出、分页、长提示词、中文、空格、引号及换行；查询列表不能依赖脆弱的人类可读表格解析。
 - 使用隔离 tmux server 验证 window cwd、参数传递、重复启动、退出保留及遗留状态恢复。

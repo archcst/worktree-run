@@ -1,11 +1,10 @@
-"""Interactive configuration, with short write locks and explicit project identity."""
+"""Interactive configuration with short locks and stable binding identities."""
 
 import sqlite3
 import sys
-from collections import Counter
 from pathlib import Path
 
-from . import agents, config, prompt, worktree
+from . import agents, bindings, config, prompt, worktree
 from .linear import Linear
 from .util import Error, clean
 
@@ -208,33 +207,59 @@ def field(label, default, validate, *, path=False):
             default = value
 
 
-def projects(store, workspace):
-    rows = store.all("SELECT * FROM projects ORDER BY workspace_slug,name")
-    return [row for row in rows if not workspace or row["workspace_slug"] == workspace]
+def binding_choices(rows):
+    return [(bindings.key(row), bindings.describe(row)) for row in rows]
 
 
 def project_choices(rows):
-    counts = Counter((row["workspace_slug"], row["name"]) for row in rows)
     return [
         (
             (row["workspace"], row["project_id"]),
-            f"{row['name']} · {row['workspace_slug']}"
-            + (
-                f" [{row['project_id']}]"
-                if counts[(row["workspace_slug"], row["name"])] > 1
-                else ""
-            ),
+            f"{row['name']} · {row['workspace_slug']} [{row['project_id']}]",
         )
         for row in rows
     ]
 
 
-def pick_project(store, workspace, title):
-    rows = projects(store, workspace)
-    if not rows:
-        notice("尚未绑定项目", "请进入 main worktree 根目录，在「项目管理」中绑定当前仓库。")
-        return None
-    return menu(title, [*project_choices(rows), (None, "返回")], search=True)
+def edit_project_prompt(store, workspace):
+    choice = menu(
+        "选择项目提示词",
+        [
+            *project_choices(store.projects(workspace)),
+            ("other", "选择其他 Linear 项目"),
+            (None, "返回"),
+        ],
+        search=True,
+    )
+    if choice is None:
+        return
+    if choice == "other":
+        linear = Linear(workspace)
+        target = menu(
+            "选择 Linear 项目提示词",
+            [
+                *[(row, bindings.target_text("project", row)) for row in linear.projects()],
+                (None, "返回"),
+            ],
+            text=f"Linear 工作区：{linear.slug}",
+            search=True,
+        )
+        if target is None:
+            return
+        row = dict(
+            workspace=linear.workspace,
+            workspace_slug=linear.slug,
+            project_id=target["id"],
+            name=target["name"],
+        )
+        with store.lock():
+            store.save_project(row)
+    else:
+        row = store.project(*choice)
+        if row is None:
+            raise Error("项目元数据已不存在，请重新选择")
+    path = prompt.edit(row)
+    notice("项目提示词已保存", str(path))
 
 
 def valid_root(value):
@@ -261,39 +286,41 @@ def suggested_baseline(repo):
     return "origin/main"
 
 
-def save_project(store, row, *, expected=None):
-    # Do not hold the orchestration lock while prompting, querying Linear or editing files.
+def save_binding(store, row, *, expected=None):
+    # Keep the lock out of menus, Linear queries, and editor sessions.
     with store.lock():
-        current = store.project(row["workspace"], row["project_id"])
+        current = store.binding(*bindings.key(row))
         if current != expected:
-            raise Error("项目绑定已被其他进程修改，请重新选择后再保存")
-        prompt.initialize(row["workspace"], row["project_id"])
-        store.save_project(row)
+            raise Error("仓库绑定已被其他进程修改，请重新选择后再保存")
+        store.save_binding(row)
 
 
-def add_project(store, workspace):
+def add_binding(store, workspace):
     repo = worktree.main_repository(Path.cwd(), command="wtr config")
-    linear = Linear(workspace)
-    rows = [row for row in linear.projects() if not store.project(linear.workspace, row["id"])]
-    if not rows:
-        notice("没有可绑定的项目", "当前 Linear 工作区没有未绑定项目，可返回管理已有绑定。")
+    kind = menu(
+        "选择绑定类型",
+        [("project", "Project（项目）"), ("label", "Label（标签）"), (None, "返回")],
+        text=f"仓库：{repo}",
+    )
+    if kind is None:
         return None
-    counts = Counter(row["name"] for row in rows)
-    project_id = menu(
+    linear = Linear(workspace)
+    targets = linear.projects() if kind == "project" else linear.labels()
+    rows = [row for row in targets if not store.binding(linear.workspace, kind, row["id"])]
+    if not rows:
+        notice("没有可绑定的对象", "当前 Linear 工作区没有该类型的未绑定对象，可返回管理已有绑定。")
+        return None
+    target = menu(
         "绑定当前仓库",
         [
-            *[
-                (row["id"], row["name"] + (f" [{row['id']}]" if counts[row["name"]] > 1 else ""))
-                for row in rows
-            ],
+            *[(row, bindings.target_text(kind, row)) for row in rows],
             (None, "返回"),
         ],
         text=f"仓库：{repo}\nLinear 工作区：{linear.slug}",
         search=True,
     )
-    if project_id is None:
+    if target is None:
         return None
-    project = next(row for row in rows if row["id"] == project_id)
     baseline = field(
         "新分支基线", suggested_baseline(repo), lambda value: valid_baseline(repo, value)
     )
@@ -302,40 +329,81 @@ def add_project(store, workspace):
     root = field("issue worktree 根目录", repo, valid_root, path=True)
     if root is None:
         return None
-    row = dict(
-        workspace=linear.workspace,
-        workspace_slug=linear.slug,
-        project_id=project_id,
-        name=project["name"],
-        repo=repo,
-        baseline=baseline,
-        root=root,
+    row = bindings.from_target(linear, kind, target, dict(repo=repo, baseline=baseline, root=root))
+    save_binding(store, row)
+    return bindings.key(row)
+
+
+def change_binding_target(store, row):
+    kind = menu(
+        "修改匹配方式",
+        [("project", "Project（项目）"), ("label", "Label（标签）"), (None, "返回")],
+        text=f"当前绑定：{bindings.describe(row)}",
+        default=row["kind"],
     )
-    save_project(store, row)
-    return linear.workspace, project_id
+    if kind is None:
+        return None
+    linear = Linear(row["workspace_slug"])
+    if linear.workspace != row["workspace"]:
+        raise Error("Linear workspace 与原绑定不一致，未修改绑定")
+    targets = linear.projects() if kind == "project" else linear.labels()
+    target = menu(
+        "选择匹配对象",
+        [*[(target, bindings.target_text(kind, target)) for target in targets], (None, "返回")],
+        text=f"Linear 工作区：{linear.slug}",
+        default=next(
+            (
+                target
+                for target in targets
+                if kind == row["kind"] and target["id"] == row["target_id"]
+            ),
+            None,
+        ),
+        search=True,
+    )
+    if target is None:
+        return None
+    replacement = bindings.from_target(
+        linear, kind, target, {field: row[field] for field in ("repo", "baseline", "root")}
+    )
+    confirmed = menu(
+        "确认修改匹配方式/对象",
+        [(False, "保留原绑定"), (True, "确认修改")],
+        text=(
+            f"原绑定：{bindings.describe(row)}\n新绑定：{bindings.describe(replacement)}\n"
+            f"仓库：{row['repo']}\n基线：{row['baseline']}\nworktree 根目录：{row['root']}\n"
+            "仓库设置、已有 issue 关联、项目提示词和执行记录保持不变。"
+        ),
+        default=False,
+    )
+    if confirmed is not True:
+        return None
+    with store.lock():
+        store.replace_binding(row, replacement)
+    return bindings.key(replacement)
 
 
-def project_settings(store, key):
-    selected = "prompt"
+def binding_settings(store, key):
+    selected = "baseline"
     while True:
-        row = store.project(*key)
+        row = store.binding(*key)
         if row is None:
-            notice("项目绑定已不存在", "请返回项目列表重新选择。")
+            notice("仓库绑定已不存在", "请返回绑定列表重新选择。")
             return
         text = (
-            f"工作区：{row['workspace_slug']}\nmain worktree：{row['repo']}\n"
+            f"绑定：{bindings.describe(row)}\nmain worktree：{row['repo']}\n"
             f"分支基线：{row['baseline']}\nissue worktree 根目录：{row['root']}\n"
-            f"提示词：{prompt.prompt_path(*key)}\n修改后即时保存，只影响新任务。"
+            "修改后即时保存，只影响新任务。"
         )
         action = menu(
-            f"项目设置：{row['name']}",
+            f"绑定设置：{row['name']}",
             [
-                ("prompt", "编辑项目提示词"),
+                ("target", "修改匹配方式/对象"),
                 ("baseline", "修改新分支基线"),
                 ("root", "修改 issue worktree 根目录"),
                 ("repo", "重新绑定到当前仓库"),
-                ("remove", "解除项目绑定"),
-                (None, "返回项目列表"),
+                ("remove", "解除仓库绑定"),
+                (None, "返回绑定列表"),
             ],
             text=text,
             default=selected,
@@ -344,9 +412,10 @@ def project_settings(store, key):
             return
         selected = action
         try:
-            if action == "prompt":
-                path = prompt.edit(row)
-                notice("项目提示词已保存", str(path))
+            if action == "target":
+                replacement_key = change_binding_target(store, row)
+                if replacement_key is not None:
+                    key = replacement_key
             elif action in ("baseline", "root"):
                 value = field(
                     "新分支基线" if action == "baseline" else "issue worktree 根目录",
@@ -357,13 +426,13 @@ def project_settings(store, key):
                     path=action == "root",
                 )
                 if value is not None:
-                    save_project(store, dict(row, **{action: value}), expected=row)
+                    save_binding(store, dict(row, **{action: value}), expected=row)
             elif action == "repo":
                 repo = worktree.main_repository(Path.cwd(), command="wtr config")
                 confirmed = menu(
                     "确认重新绑定",
                     [(False, "保留当前绑定"), (True, "确认绑定当前仓库")],
-                    text=f"项目：{row['name']}\n当前绑定：{row['repo']}\n新仓库：{repo}\n已有 issue 的 worktree 关联不变。",
+                    text=f"绑定：{bindings.describe(row)}\n当前绑定：{row['repo']}\n新仓库：{repo}\n已有 issue 的 worktree 关联不变。",
                     default=False,
                 )
                 if confirmed is True:
@@ -371,19 +440,19 @@ def project_settings(store, key):
                         "新分支基线", row["baseline"], lambda value: valid_baseline(repo, value)
                     )
                     if baseline is not None:
-                        save_project(store, dict(row, repo=repo, baseline=baseline), expected=row)
+                        save_binding(store, dict(row, repo=repo, baseline=baseline), expected=row)
             elif action == "remove":
                 confirmed = menu(
                     "确认解除绑定",
                     [(False, "保留绑定"), (True, "确认解除绑定")],
-                    text=f"项目：{row['name']}\n仓库：{row['repo']}\n只解除项目绑定，保留 worktree、项目提示词和执行记录。",
+                    text=f"绑定：{bindings.describe(row)}\n仓库：{row['repo']}\n只解除仓库绑定，保留 worktree、项目提示词和执行记录。",
                     default=False,
                 )
                 if confirmed is True:
                     with store.lock():
-                        if store.project(*key) != row:
-                            raise Error("项目绑定已被其他进程修改，请重新选择后再操作")
-                        store.write("DELETE FROM projects WHERE workspace=? AND project_id=?", key)
+                        if store.binding(*key) != row:
+                            raise Error("仓库绑定已被其他进程修改，请重新选择后再操作")
+                        store.remove_binding(*key)
                     return
         except (Error, OSError, ValueError, sqlite3.Error) as exc:
             notice("操作失败", str(exc))
@@ -391,25 +460,25 @@ def project_settings(store, key):
             pass
 
 
-def manage_projects(store, workspace):
+def manage_bindings(store, workspace):
     while True:
-        rows = projects(store, workspace)
+        rows = store.bindings(workspace)
         choice = menu(
-            "项目管理",
+            "仓库绑定",
             [
-                ("add", "＋ 绑定当前仓库的 Linear 项目"),
-                *project_choices(rows),
+                ("add", "＋ 绑定当前仓库的 Project 或 Label"),
+                *binding_choices(rows),
                 (None, "返回配置"),
             ],
-            text=f"当前目录：{Path.cwd()}\n选择已有项目进行编辑；新增绑定需要位于 main worktree 根目录。",
+            text=f"当前目录：{Path.cwd()}\n选择已有绑定进行编辑；新增绑定需要位于 main worktree 根目录。",
             search=True,
         )
         if choice is None:
             return
         try:
-            key = add_project(store, workspace) if choice == "add" else choice
+            key = add_binding(store, workspace) if choice == "add" else choice
             if key is not None:
-                project_settings(store, key)
+                binding_settings(store, key)
         except (Error, OSError, ValueError, sqlite3.Error) as exc:
             notice("操作失败", str(exc))
 
@@ -460,17 +529,18 @@ def set_tmux_session(store):
 
 def select_workspace(store, current):
     slugs = sorted(
-        {row["workspace_slug"] for row in projects(store, None)} | ({current} if current else set())
+        {row["workspace_slug"] for row in store.bindings() + store.projects()}
+        | ({current} if current else set())
     )
     choice = menu(
         "工作区筛选",
         [
-            (("scope", None), "全部绑定（新增使用 Linear CLI 默认工作区）"),
+            (("scope", None), "全部工作区（新增使用 Linear CLI 默认工作区）"),
             *[(("scope", slug), slug) for slug in slugs],
             (("input", None), "输入其他工作区 slug"),
             (None, "返回配置"),
         ],
-        text="只影响本次配置中的项目范围，不修改 Linear CLI 的默认工作区。",
+        text="只影响本次配置中的绑定和提示词项目范围，不修改 Linear CLI 的默认工作区。",
         default=("scope", current),
     )
     if choice is None:
@@ -484,15 +554,15 @@ def select_workspace(store, current):
 def run(store, workspace=None):
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         raise Error("wtr config 需要交互终端；脚本可使用 wtr config list 或 wtr config set")
-    selected = "projects"
+    selected = "bindings"
     while True:
         default = store.setting("agent") or "每次启动时选择"
         session = store.setting("tmux-session", "worktree-run")
-        rows = projects(store, workspace)
+        rows = store.bindings(workspace)
         action = menu(
             "wtr 配置",
             [
-                ("projects", f"项目管理（{len(rows)} 个绑定）"),
+                ("bindings", f"仓库绑定（{len(rows)} 个）"),
                 ("prompt", "项目提示词"),
                 ("agent", f"默认 agent：{default}"),
                 ("tmux", f"tmux session：{session}"),
@@ -500,23 +570,17 @@ def run(store, workspace=None):
                 ("overview", "查看当前配置"),
                 (None, "退出"),
             ],
-            text=f"当前目录：{Path.cwd()}\n项目范围：{workspace or '全部（新增使用 Linear CLI 默认工作区）'}\n默认 agent 和 tmux 设置全局生效；确认后即时保存。",
+            text=f"当前目录：{Path.cwd()}\n工作区范围：{workspace or '全部（新增使用 Linear CLI 默认工作区）'}\n默认 agent 和 tmux 设置全局生效；确认后即时保存。",
             default=selected,
         )
         if action is None:
             return
         selected = action
         try:
-            if action == "projects":
-                manage_projects(store, workspace)
+            if action == "bindings":
+                manage_bindings(store, workspace)
             elif action == "prompt":
-                key = pick_project(store, workspace, "选择项目提示词")
-                if key is not None:
-                    row = store.project(*key)
-                    if row is None:
-                        raise Error("项目绑定已不存在，请重新选择")
-                    path = prompt.edit(row)
-                    notice("项目提示词已保存", str(path))
+                edit_project_prompt(store, workspace)
             elif action == "agent":
                 set_default_agent(store)
             elif action == "tmux":
@@ -526,7 +590,7 @@ def run(store, workspace=None):
             elif action == "overview":
                 notice(
                     "当前配置",
-                    f"默认 agent：{default}\ntmux session：{session}\n项目范围：{workspace or '全部'}\n项目绑定：{len(rows)} 个\n数据库：{store.path}\n项目提示词目录：{prompt.directory()}",
+                    f"默认 agent：{default}\ntmux session：{session}\n工作区范围：{workspace or '全部'}\n仓库绑定：{len(rows)} 个\n数据库：{store.path}\n项目提示词目录：{prompt.directory()}",
                 )
         except (Error, OSError, ValueError, sqlite3.Error) as exc:
             notice("操作失败", str(exc))
