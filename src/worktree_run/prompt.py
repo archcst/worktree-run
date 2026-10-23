@@ -1,4 +1,4 @@
-"""Project-scoped prompt files, keyed by stable Linear identities."""
+"""Prompt files owned by stable local WTR project identities."""
 
 import os
 import re
@@ -25,8 +25,8 @@ def prompt_path(workspace_id, project_id):
         return None
     for value in (workspace_id, project_id):
         if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", value):
-            raise Error("提示词路径需要有效的 Linear workspace/project ID")
-    return (directory() / workspace_id / f"{project_id}.md").resolve()
+            raise Error("提示词路径需要有效的 workspace/WTR project ID")
+    return (directory() / workspace_id / "wtr" / f"{project_id}.md").resolve()
 
 
 def initialize(workspace_id, project_id):

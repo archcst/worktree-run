@@ -1,7 +1,7 @@
 import contextlib
 import io
 import json
-import sqlite3
+import uuid
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -10,7 +10,6 @@ from support import ISSUE, Sandbox
 from worktree_run import bindings, prompt, worktree
 from worktree_run.cli import resolve_binding
 from worktree_run.linear import Linear
-from worktree_run.store import Store
 from worktree_run.util import Error
 
 LABEL = {"id": "label-1", "name": "repo:app", "team": None}
@@ -28,10 +27,16 @@ class BindingTests(Sandbox):
         return dict(ISSUE, project=project, labels=connection(list(labels) or [LABEL]))
 
     def label_binding(self, **values):
-        row = dict(self.binding, kind="label", target_id="label-1", name="repo:app")
+        row = dict(
+            self.binding,
+            project_id=str(uuid.uuid4()),
+            kind="label",
+            target_id="label-1",
+            target_name="repo:app",
+            name="Local app",
+        )
         row.update(values)
-        self.store.save_binding(row)
-        return row
+        return self.store.save_binding(row)
 
     def fixture_issue(self, issue):
         fixture = json.loads(self.fixture.read_text())
@@ -84,11 +89,14 @@ class BindingTests(Sandbox):
     def test_existing_issue_keeps_repository_after_label_change_and_binding_removal(self):
         row = worktree.route(self.store, self.context(), ISSUE, self.binding)
         self.store.save_issue(row)
-        self.store.write("DELETE FROM bindings")
+        self.store.remove_binding(*bindings.key(self.binding))
         self.label_binding(repo="/another/repository")
-        self.assertEqual(
-            resolve_binding(self.store, self.context(), self.labeled_issue(), True), row
-        )
+        selected = resolve_binding(self.store, self.context(), self.labeled_issue(), True)
+        self.assertEqual(selected, dict(self.binding, enabled=0))
+        routed = worktree.route(self.store, self.context(), self.labeled_issue(), selected)
+        self.assertEqual(routed["wtr_project_id"], self.binding["project_id"])
+        for field in ("repo", "baseline", "branch", "worktree"):
+            self.assertEqual(routed[field], row[field])
 
     def test_missing_binding_is_actionable_and_dry_run_never_prompts_or_writes(self):
         before = self.store.path.read_bytes()
@@ -128,78 +136,68 @@ class BindingTests(Sandbox):
         self.assertNotIn("\x1b", stdout.getvalue())
         self.assertEqual(len(self.store.bindings()), 1)
 
-    def test_initialization_preserves_history_without_importing_project_bindings(self):
-        row = worktree.route(self.store, self.context(), ISSUE, self.binding)
-        self.store.save_issue(row)
-        run_id = self.store.new_run(row, "pi", ["pi", "prompt"], None)
-        self.store.update_run(run_id, status="failed")
-        path = self.base / "existing.db"
-        with sqlite3.connect(path) as db:
-            self.store.db.backup(db)
-            db.executescript("""
-                DROP TABLE bindings;
-                DROP TABLE prompt_projects;
-                CREATE TABLE projects (workspace,project_id,name,workspace_slug,repo,baseline,root);
-                PRAGMA user_version=1;
-            """)
-            db.execute(
-                "INSERT INTO projects VALUES (?,?,?,?,?,?,?)",
-                (
-                    "ws-uuid",
-                    "project-1",
-                    "Project",
-                    "test-space",
-                    str(self.repo),
-                    "main",
-                    "trees",
-                ),
-            )
-        before = path.read_bytes()
-        with self.assertRaisesRegex(Error, "wtr config"):
-            Store(path, readonly=True)
-        self.assertEqual(path.read_bytes(), before)
-        reopened = Store(path)
-        try:
-            self.assertEqual(reopened.bindings(), [])
-            self.assertEqual(reopened.projects(), [])
-            self.assertEqual(len(reopened.all("SELECT * FROM projects")), 1)
-            self.assertEqual(reopened.issue("ws-uuid", ISSUE["id"]), row)
-            self.assertEqual(reopened.run(run_id), self.store.run(run_id))
-            self.assertEqual(reopened.one("PRAGMA user_version")["user_version"], 2)
-        finally:
-            reopened.close()
-        self.assertFalse(prompt.directory().exists())
-
-    def test_label_binding_dry_run_preserves_project_prompt_scope(self):
-        self.store.write("DELETE FROM bindings")
-        self.label_binding()
+    def test_label_binding_dry_run_uses_local_project_template(self):
+        self.store.remove_binding(*bindings.key(self.binding))
+        label = self.label_binding()
         self.install_agent()
         self.store.set_setting("agent", "pi")
-        template = prompt.initialize("ws-uuid", "project-1")
-        template.write_text("PROJECT {{issue_id}}")
+        template = prompt.initialize("ws-uuid", label["project_id"])
+        template.write_text("LOCAL {{issue_id}}")
+        prompt.initialize("ws-uuid", self.binding["project_id"]).write_text("OTHER {{issue_id}}")
         self.fixture_issue(self.labeled_issue(project=ISSUE["project"]))
         before = self.store.path.read_bytes()
         result = self.cli("ENG-123", "--dry-run")
         self.assertEqual(result.returncode, 0, result.stderr)
         plan = json.loads(result.stdout)
         self.assertEqual(plan["issue"]["repo"], str(self.repo.resolve()))
-        self.assertTrue(plan["argv"][-1].endswith("PROJECT ENG-123"))
+        self.assertEqual(plan["issue"]["project_id"], ISSUE["project"]["id"])
+        self.assertEqual(plan["issue"]["wtr_project_id"], label["project_id"])
+        self.assertTrue(plan["argv"][-1].endswith("LOCAL ENG-123"))
         self.assertEqual(self.store.path.read_bytes(), before)
         self.assertFalse((self.base / "trees").exists())
         self.assertFalse((self.base / "tmux.sock").exists())
 
-    def test_label_binding_without_project_uses_default_prompt(self):
-        self.label_binding()
+    def test_label_binding_without_linear_project_uses_local_template(self):
+        label = self.label_binding()
+        template = prompt.initialize("ws-uuid", label["project_id"])
+        template.write_text("LABEL PROJECT {{issue_id}}")
         self.install_agent()
         self.fixture_issue(self.labeled_issue())
         result = self.cli("ENG-123", "--agent", "pi", "--dry-run")
         self.assertEqual(result.returncode, 0, result.stderr)
         plan = json.loads(result.stdout)
         self.assertIsNone(plan["issue"]["project_id"])
-        self.assertTrue(
-            plan["argv"][-1].endswith(prompt.DEFAULT.replace("{{issue_id}}", "ENG-123"))
-        )
-        self.assertFalse(prompt.directory().exists())
+        self.assertEqual(plan["issue"]["wtr_project_id"], label["project_id"])
+        self.assertTrue(plan["argv"][-1].endswith("LABEL PROJECT ENG-123"))
+        self.assertEqual(list(prompt.directory().rglob("*.md")), [template])
+
+    def test_local_project_defaults_override_global_and_explicit_agent_wins(self):
+        self.install_agent("pi")
+        self.install_agent("codex")
+        self.store.set_setting("agent", "codex")
+        self.store.set_setting("tmux-session", "global-session")
+        label = self.label_binding(agent="pi", tmux_session="local-session")
+        issue = self.labeled_issue()
+        self.fixture_issue(issue)
+        prompt.initialize("ws-uuid", label["project_id"]).write_text("LOCAL {{issue_id}}")
+        for args, expected in (((), "pi"), (("--agent", "codex"), "codex")):
+            with self.subTest(args=args):
+                result = self.cli("ENG-123", "--dry-run", *args)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                plan = json.loads(result.stdout)
+                self.assertEqual(plan["agent"], expected)
+                self.assertEqual(plan["tmux_session"], "local-session")
+                self.assertTrue(plan["argv"][-1].endswith("LOCAL ENG-123"))
+        self.store.save_issue(worktree.route(self.store, self.context(), issue, label))
+        self.store.remove_binding(*bindings.key(label))
+        self.fixture_issue(ISSUE)
+        result = self.cli("ENG-123", "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plan = json.loads(result.stdout)
+        self.assertEqual(plan["issue"]["wtr_project_id"], label["project_id"])
+        self.assertEqual(plan["agent"], "pi")
+        self.assertEqual(plan["tmux_session"], "local-session")
+        self.assertTrue(plan["argv"][-1].endswith("LOCAL ENG-123"))
 
     def test_cli_add_full_label_and_mutually_exclusive_types(self):
         result = self.cli(
@@ -218,6 +216,10 @@ class BindingTests(Sandbox):
         self.assertEqual(row["kind"], "label")
         self.assertEqual(row["target_id"], "label-1")
         self.assertEqual(row["name"], "repo:app")
+        self.assertEqual(row["target_name"], "repo:app")
+        self.assertNotEqual(row["project_id"], self.binding["project_id"])
+        self.assertNotEqual(row["project_id"], row["target_id"])
+        self.assertEqual(self.store.project("ws-uuid", row["project_id"]), row)
         result = self.cli(
             "binding", "add", "--label", "repo:app", "--project", "Project", cwd=self.repo
         )

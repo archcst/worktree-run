@@ -1,19 +1,22 @@
 import json
 import shlex
 import sys
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from support import Sandbox
+from support import ISSUE, Sandbox
 
+from worktree_run import cli, prompt
 from worktree_run.cli import ask
 from worktree_run.tmux import Tmux
+from worktree_run.util import Error
 from worktree_run.worktree import git
 
 
 class BindingAddTests(Sandbox):
     def setUp(self):
         super().setUp()
-        self.store.write("DELETE FROM bindings")
+        self.store.remove_binding(*cli.bindings.key(self.binding))
 
     def add(self, cwd):
         return self.cli(
@@ -39,6 +42,29 @@ class BindingAddTests(Sandbox):
         self.assertNotIn("Linear unavailable", result.stderr)
         self.assertEqual(self.store.bindings(), [])
         return result
+
+    def test_project_add_accepts_local_name_and_lists_disabled_projects(self):
+        result = self.cli(
+            "project",
+            "add",
+            "--project",
+            "project-1",
+            "--name",
+            "Local App",
+            "--baseline",
+            "main",
+            "--root",
+            str(self.base / "trees"),
+            cwd=self.repo,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        row = json.loads(result.stdout)
+        self.assertEqual(row["name"], "Local App")
+        self.assertEqual(row["target_name"], "Project")
+        self.assertNotEqual(row["project_id"], "project-1")
+        listing = self.cli("project", "list")
+        self.assertEqual(listing.returncode, 0, listing.stderr)
+        self.assertEqual({r["enabled"] for r in json.loads(listing.stdout)}, {0, 1})
 
     def test_binds_current_main_root_without_path_prompt(self):
         result = self.add(self.repo)
@@ -178,6 +204,42 @@ class BindingAddTests(Sandbox):
             self.assertEqual(ask("root", default, editable=True), "/tmp/custom trees")
         self.assertEqual(input_prompt.call_args.kwargs["default"], default)
 
+    def test_target_change_preserves_local_identity_template_and_overrides(self):
+        original = dict(self.binding, name="Local App", agent="codex", tmux_session="local-session")
+        self.store.save_binding(original)
+        path = prompt.initialize(original["workspace"], original["project_id"])
+        path.write_text("Local template {{issue_id}}")
+        result = self.cli("project", "edit", "Local App", "--label", "label-1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        row = json.loads(result.stdout)
+        for key in ("project_id", "name", "repo", "baseline", "root", "agent", "tmux_session"):
+            self.assertEqual(row[key], original[key])
+        self.assertEqual(row["target_name"], "repo:app")
+        self.assertEqual(row["kind"], "label")
+        self.assertEqual(path.read_text(), "Local template {{issue_id}}")
+        self.assertIsNone(self.store.binding("ws-uuid", "project", "project-1"))
+        result = self.cli("project", "edit", row["project_id"], "--name", "Renamed App")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["name"], "Renamed App")
+        self.assertEqual(path.read_text(), "Local template {{issue_id}}")
+
+    def test_removing_disabled_project_does_not_disable_new_target_owner(self):
+        result = self.add(self.repo)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        current = json.loads(result.stdout)
+        result = self.cli("project", "remove", self.binding["project_id"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.store.binding("ws-uuid", "project", "project-1"), current)
+        self.assertEqual(self.store.project("ws-uuid", self.binding["project_id"])["enabled"], 0)
+
+    def test_disabled_project_target_change_reenables_matching(self):
+        result = self.cli("project", "edit", self.binding["project_id"], "--label", "label-1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        row = json.loads(result.stdout)
+        self.assertEqual(row["project_id"], self.binding["project_id"])
+        self.assertEqual(row["enabled"], 1)
+        self.assertEqual(self.store.binding("ws-uuid", "label", "label-1"), row)
+
     def test_edit_remains_available_from_other_directories(self):
         self.assertEqual(self.add(self.repo).returncode, 0)
         result = self.cli(
@@ -195,3 +257,102 @@ class BindingAddTests(Sandbox):
         self.assertEqual(
             json.loads(result.stdout)["root"], str((self.base / "edited trees").resolve())
         )
+
+
+class LocalProjectTests(Sandbox):
+    def test_prompt_selection_uses_local_name_or_id_without_linear(self):
+        with patch.object(cli, "Linear") as linear:
+            for name in (self.binding["name"], self.binding["project_id"]):
+                row = cli.prompt_project(self.store, SimpleNamespace(workspace=None, project=name))
+                self.assertEqual(row, self.binding)
+            with self.assertRaisesRegex(Error, "本地 WTR 项目"):
+                cli.prompt_project(self.store, SimpleNamespace(workspace=None, project="project-1"))
+            with self.assertRaisesRegex(Error, "创建"):
+                cli.prompt_project(self.store, SimpleNamespace(workspace="missing", project=None))
+        linear.assert_not_called()
+
+    def test_prompt_infers_local_label_project_in_repository_and_issue_worktree(self):
+        local = dict(self.binding, kind="label", target_id="label-1", target_name="repo:app")
+        self.store.replace_binding(self.binding, local)
+        issue = cli.worktree.route(
+            self.store, SimpleNamespace(workspace="ws-uuid", slug="test-space"), ISSUE, local
+        )
+        self.store.save_issue(issue)
+        args = SimpleNamespace(workspace=None, project=None)
+        with patch.object(cli, "Linear") as linear:
+            for cwd in (self.repo, self.repo / "src", cli.Path(issue["worktree"]) / "src"):
+                with patch.object(cli.Path, "cwd", return_value=cwd):
+                    self.assertEqual(
+                        cli.prompt_project(self.store, args)["project_id"], local["project_id"]
+                    )
+        linear.assert_not_called()
+
+    def test_associated_issue_resolves_disabled_local_project_not_issue_row(self):
+        linear = SimpleNamespace(workspace="ws-uuid", slug="test-space")
+        issue_row = cli.worktree.route(self.store, linear, ISSUE, self.binding)
+        self.store.save_issue(issue_row)
+        self.store.remove_binding(*cli.bindings.key(self.binding))
+        changed_issue = dict(ISSUE, project={"id": "different-remote", "name": "Different"})
+        result = cli.resolve_binding(self.store, linear, changed_issue, True)
+        self.assertEqual(result["project_id"], "wtr-project-1")
+        self.assertEqual(result["enabled"], 0)
+        self.assertNotIn("issue_id", result)
+        with patch.object(self.store, "project", return_value=None):
+            with self.assertRaisesRegex(Error, "本地 WTR 项目不存在"):
+                cli.resolve_binding(self.store, linear, changed_issue, True)
+
+    def test_agent_precedence_override_project_global_and_interactive_choice(self):
+        self.store.set_setting("agent", "pi")
+        project = dict(self.binding, agent="codex")
+        self.assertEqual(cli.selected_agent(self.store, None, project), "codex")
+        self.assertEqual(cli.selected_agent(self.store, "claude", project), "claude")
+        self.assertEqual(cli.selected_agent(self.store, None, self.binding), "pi")
+        self.assertEqual(cli.selected_agent(self.store, None), "pi")
+        with (
+            patch.object(cli.agents, "catalog", return_value=[dict(name="pi", installed=True)]),
+            patch.object(cli, "choose", return_value={"name": "pi"}) as choose,
+            patch("sys.stdin.isatty", return_value=True),
+        ):
+            self.assertEqual(cli.selected_agent(self.store, "", project), "pi")
+        choose.assert_called_once()
+
+    def test_start_dry_run_passes_project_execution_overrides(self):
+        self.install_agent("pi")
+        self.install_agent("codex")
+        self.store.set_setting("agent", "pi")
+        self.store.set_setting("tmux-session", "global-session")
+        self.store.save_binding(dict(self.binding, agent="codex", tmux_session="project-session"))
+        result = self.cli(ISSUE["identifier"], "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plan = json.loads(result.stdout)
+        self.assertEqual(plan["agent"], "codex")
+        self.assertEqual(plan["tmux_session"], "project-session")
+        result = self.cli(ISSUE["identifier"], "--dry-run", "--agent", "pi")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["agent"], "pi")
+        self.assertEqual(self.store.all("SELECT * FROM runs"), [])
+
+    def test_start_launch_receives_local_project_agent(self):
+        project = dict(self.binding, agent="codex")
+        self.store.save_binding(project)
+        run = dict(
+            id="run",
+            status="running",
+            session_id="s",
+            window_id="w",
+            pane_id="p",
+            tmux_socket="socket",
+        )
+        args = SimpleNamespace(
+            workspace=None, issue="ENG-1", dry_run=False, agent=None, no_attach=True
+        )
+        with (
+            patch.object(cli, "Linear") as linear,
+            patch.object(cli.runner, "recover"),
+            patch.object(cli.runner, "launch", return_value=run) as launch,
+            patch.object(cli, "output"),
+        ):
+            linear.return_value.workspace = "ws-uuid"
+            linear.return_value.issue.return_value = ISSUE
+            cli.start(self.store, args)
+        self.assertEqual(launch.call_args.args[-2:], (project, "codex"))

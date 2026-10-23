@@ -16,7 +16,7 @@ from .store import Store
 from .tmux import Tmux
 from .util import Error, clean, require
 
-COMMANDS = {"start", "binding", "agent", "config", "prompt", "runs", "_run"}
+COMMANDS = {"start", "project", "binding", "agent", "config", "prompt", "runs", "_run"}
 
 
 def ask(label, default=None, *, editable=False):
@@ -125,7 +125,7 @@ def binding_values(args, previous=None, *, repo=None):
     previous = previous or {}
     repo = worktree.main_repository(
         repo or getattr(args, "repo", None) or ask("main worktree 绝对路径", previous.get("repo")),
-        command="wtr binding add",
+        command="wtr project add",
     )
     baseline = args.baseline or ask("新分支基线", previous.get("baseline", "origin/main"))
     worktree.verify_baseline(repo, baseline)
@@ -146,9 +146,12 @@ def binding_values(args, previous=None, *, repo=None):
 
 def select_local(rows, name):
     if name:
-        matches = [
-            r for r in rows if name in (r.get("name"), r.get("project_id"), r.get("target_id"))
-        ]
+        matches = [r for r in rows if name == r.get("project_id")]
+        if not matches:
+            matches = [r for r in rows if name == r.get("name")]
+        if not matches:
+            targets = [r for r in rows if name == r.get("target_id")]
+            matches = [r for r in targets if r.get("enabled")] or targets
         if len(matches) != 1:
             raise Error("记录不存在或名称重复；请使用明确 ID")
         return matches[0]
@@ -175,7 +178,7 @@ def remote_target(linear, kind, name=None):
 
 def binding_command(store, args):
     repo = worktree.main_repository(Path.cwd()) if args.action == "add" else None
-    rows = store.bindings(args.workspace)
+    rows = store.projects(args.workspace)
     if args.action == "list":
         output(rows)
         return
@@ -191,14 +194,16 @@ def binding_command(store, args):
             name = None
         linear = Linear(args.workspace)
         target = remote_target(linear, kind, name)
-        row = bindings.from_target(linear, kind, target, {})
+        values = {"name": args.new_name} if args.new_name is not None else {}
+        row = bindings.from_target(linear, kind, target, values)
         if store.binding(*bindings.key(row)):
-            raise Error("该对象已绑定，请使用 wtr binding edit")
+            raise Error("该对象已匹配其他 WTR 项目，请使用 wtr project edit")
     else:
         rows = [r for r in rows if not args.kind or r["kind"] == args.kind]
         row = select_local(rows, args.name)
     if args.action == "remove":
-        store.remove_binding(*bindings.key(row))
+        if row["enabled"]:
+            store.remove_binding(*bindings.key(row))
         return
     previous = dict(row)
     changing_target = args.action == "edit" and (args.project is not None or args.label is not None)
@@ -210,9 +215,7 @@ def binding_command(store, args):
         if linear.workspace != row["workspace"]:
             raise Error("Linear workspace 与原绑定不一致，未修改绑定")
         target = remote_target(linear, kind, name)
-        row = bindings.from_target(
-            linear, kind, target, {field: row[field] for field in ("repo", "baseline", "root")}
-        )
+        row = bindings.from_target(linear, kind, target, dict(row, enabled=1))
         if args.repo or args.baseline or args.root:
             values = argparse.Namespace(
                 **{
@@ -221,8 +224,16 @@ def binding_command(store, args):
                 }
             )
             row.update(binding_values(values))
-    else:
+    elif not (
+        args.action == "edit"
+        and args.new_name is not None
+        and not (args.repo or args.baseline or args.root)
+    ):
         row.update(binding_values(args, row, repo=repo))
+    if args.new_name is not None:
+        if not args.new_name.strip():
+            raise Error("WTR 项目名称不能为空")
+        row["name"] = args.new_name.strip()
     if args.action == "edit":
         store.replace_binding(previous, row)
     else:
@@ -232,37 +243,26 @@ def binding_command(store, args):
 
 def prompt_project(store, args):
     rows = store.projects(args.workspace)
+    if not rows:
+        raise Error("没有本地 WTR 项目；请先运行 wtr project add 或在 wtr config 的项目管理中创建")
     if args.project:
         matches = [r for r in rows if args.project in (r["name"], r["project_id"])]
-        if matches:
-            return select_local(rows, args.project)
-    if args.project or not rows:
-        linear = Linear(args.workspace)
-        project = remote_target(linear, "project", args.project)
-        row = dict(
-            workspace=linear.workspace,
-            workspace_slug=linear.slug,
-            project_id=project["id"],
-            name=project["name"],
-        )
-        with store.lock():
-            store.save_project(row)
-        return row
+        if len(matches) != 1:
+            raise Error(
+                "本地 WTR 项目不存在或名称重复；请使用本地项目 ID，或运行 wtr project add 创建"
+            )
+        return matches[0]
 
     cwd = Path.cwd().resolve()
     by_id = {(row["workspace"], row["project_id"]): row for row in rows}
-    locations = [
-        (Path(binding["repo"]).resolve(), by_id.get((binding["workspace"], binding["target_id"])))
-        for binding in store.bindings(args.workspace)
-        if binding["kind"] == "project"
-    ]
+    locations = [(Path(row["repo"]).resolve(), row) for row in rows]
     for issue in store.all("SELECT * FROM issues"):
         if args.workspace and issue["workspace_slug"] != args.workspace:
             continue
         locations.append(
             (
                 Path(issue["worktree"]).resolve(),
-                by_id.get((issue["workspace"], issue["project_id"])),
+                by_id.get((issue["workspace"], issue["wtr_project_id"])),
             )
         )
     matches = [(len(path.parts), row) for path, row in locations if cwd.is_relative_to(path)]
@@ -270,7 +270,9 @@ def prompt_project(store, args):
         depth = max(length for length, _ in matches)
         candidates = [row for length, row in matches if length == depth]
         if any(row is None for row in candidates):
-            raise Error("当前 issue 没有可用的项目记录；请显式指定 wtr prompt edit <项目名称或ID>")
+            raise Error(
+                "当前 issue 没有可用的本地 WTR 项目；请创建 WTR 项目或显式指定 wtr prompt edit <本地项目名称或ID>"
+            )
         rows = list({(row["workspace"], row["project_id"]): row for row in candidates}.values())
         if len(rows) == 1:
             return rows[0]
@@ -288,7 +290,12 @@ def output(value):
 def resolve_binding(store, linear, issue, dry_run):
     previous = store.issue(linear.workspace, issue["id"])
     if previous:
-        return previous
+        project = store.project(linear.workspace, previous.get("wtr_project_id"))
+        if project is None:
+            raise Error(
+                "已有 issue 关联的本地 WTR 项目不存在；请恢复该项目配置，不能改用远端项目模板"
+            )
+        return project
     matches = bindings.matching(store, linear.workspace, issue)
     if len(matches) == 1:
         return matches[0]
@@ -304,7 +311,7 @@ def resolve_binding(store, linear, issue, dry_run):
         f"Project: {project['name'] if project else '无'}；"
         f"Labels: {', '.join(label['name'] for label in labels) or '无'}"
     )
-    message = f"issue 未匹配仓库绑定（{details}）；请运行 wtr config 配置「仓库绑定」"
+    message = f"issue 未匹配仓库绑定（{details}）；请运行 wtr config 的「项目管理」创建 WTR 项目并配置匹配条件"
     if dry_run or not sys.stdin.isatty():
         raise Error(message)
     candidates = []
@@ -320,8 +327,10 @@ def resolve_binding(store, linear, issue, dry_run):
     return row
 
 
-def selected_agent(store, override):
-    name = store.setting("agent") if override is None else override
+def selected_agent(store, override, project=None):
+    name = (
+        override if override is not None else (project or {}).get("agent") or store.setting("agent")
+    )
     if name:
         agents.get(name)
         return name
@@ -355,7 +364,7 @@ def start(store, args):
                 output({"action": "focus", "run": active["id"], "pane": pane})
                 return
         binding = resolve_binding(store, linear, issue, True)
-        name = selected_agent(store, args.agent)
+        name = selected_agent(store, args.agent, binding)
         row, action, argv, session = runner.plan(store, linear, issue, binding, name)
         if action == "create":
             worktree.verify_baseline(row["repo"], row["baseline"])
@@ -375,7 +384,7 @@ def start(store, args):
         run = store.active(linear.workspace, issue["id"])
         if not run:
             binding = resolve_binding(store, linear, issue, False)
-            name = selected_agent(store, args.agent)
+            name = selected_agent(store, args.agent, binding)
             run = runner.launch(store, linear, issue, binding, name)
     if args.no_attach:
         output(
@@ -407,9 +416,9 @@ def parser():
     )
     start_p.add_argument("--dry-run", action="store_true")
     start_p.add_argument("--no-attach", action="store_true", help="仅创建后台窗口")
-    group = subs.add_parser("binding", help="管理 Project/Label 仓库绑定").add_subparsers(
-        dest="action", required=True
-    )
+    group = subs.add_parser(
+        "project", aliases=["binding"], help="管理本地 WTR 项目及 Linear 匹配条件"
+    ).add_subparsers(dest="action", required=True)
     for action in ("add", "list", "edit", "remove"):
         item = group.add_parser(
             action,
@@ -420,9 +429,10 @@ def parser():
         if action == "list":
             continue
         if action != "add":
-            item.add_argument("name", nargs="?", help="当前匹配对象的完整名称或 ID")
+            item.add_argument("name", nargs="?", help="本地项目名称、项目 ID 或匹配目标 ID")
             item.add_argument("--kind", choices=bindings.KINDS, help="筛选当前绑定类型")
         if action in ("add", "edit"):
+            item.add_argument("--name", dest="new_name", help="WTR 本地项目名称")
             target = item.add_mutually_exclusive_group()
             target.add_argument("--project", help="目标 Project 的完整名称或 ID")
             target.add_argument("--label", help="目标 Label 的完整名称或 ID")
@@ -436,7 +446,7 @@ def parser():
     )
     group = subs.add_parser(
         "config",
-        help="打开交互配置菜单（仓库绑定、项目提示词、默认 agent、tmux）",
+        help="打开交互配置菜单（项目管理、项目提示词、默认 agent、tmux）",
         description="不带子命令时打开交互配置菜单；list/set 用于脚本和快捷操作。",
     ).add_subparsers(dest="action")
     group.add_parser("list")
@@ -469,16 +479,24 @@ def main(argv=None):
     args.db, args.workspace = global_args.db, global_args.workspace
     store = None
     try:
-        store = Store(args.db, readonly=getattr(args, "dry_run", False))
+        readonly = (
+            getattr(args, "dry_run", False)
+            or args.command == "agent"
+            or (args.command in ("project", "binding", "config") and args.action == "list")
+        )
+        store = Store(args.db, readonly=readonly)
         if args.command == "start":
             start(store, args)
         elif args.command == "_run":
             return runner.internal_run(store, args.run_id)
         elif args.command == "agent":
             output(agents.catalog(store.setting("agent")))
-        elif args.command == "binding":
-            with store.lock():
+        elif args.command in ("project", "binding"):
+            if args.action == "list":
                 binding_command(store, args)
+            else:
+                with store.lock():
+                    binding_command(store, args)
         elif args.command == "config":
             if args.action is None:
                 from .config_ui import run as configure

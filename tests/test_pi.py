@@ -18,7 +18,7 @@ from worktree_run.tmux import Tmux
 )
 class PiSmokeTest(Sandbox):
     def test_real_interactive_initial_prompt(self):
-        prompt.initialize("ws-uuid", "project-1").write_text(
+        prompt.initialize("ws-uuid", self.binding["project_id"]).write_text(
             "这是隔离的 CLI 启动测试，{{issue_id}} 是测试标识，不要开发或查询真实任务。\n"
             "请将 WTR_PI_ 与 OK_ENG-123 拼接成一个字符串，仅回复拼接结果。"
         )

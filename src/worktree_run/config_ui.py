@@ -208,7 +208,15 @@ def field(label, default, validate, *, path=False):
 
 
 def binding_choices(rows):
-    return [(bindings.key(row), bindings.describe(row)) for row in rows]
+    return [
+        (
+            (row["workspace"], row["project_id"]),
+            bindings.describe(row)
+            + f" · 目标 ID：{row['target_id']}"
+            + (" · 匹配已停用" if not row["enabled"] else ""),
+        )
+        for row in rows
+    ]
 
 
 def project_choices(rows):
@@ -222,44 +230,28 @@ def project_choices(rows):
 
 
 def edit_project_prompt(store, workspace):
+    rows = store.projects(workspace)
+    if not rows:
+        notice("没有本地 WTR 项目", "请先在项目管理中创建 WTR 项目，或运行 wtr project add。")
+        return
     choice = menu(
         "选择项目提示词",
-        [
-            *project_choices(store.projects(workspace)),
-            ("other", "选择其他 Linear 项目"),
-            (None, "返回"),
-        ],
+        [*project_choices(rows), (None, "返回")],
         search=True,
     )
     if choice is None:
         return
-    if choice == "other":
-        linear = Linear(workspace)
-        target = menu(
-            "选择 Linear 项目提示词",
-            [
-                *[(row, bindings.target_text("project", row)) for row in linear.projects()],
-                (None, "返回"),
-            ],
-            text=f"Linear 工作区：{linear.slug}",
-            search=True,
-        )
-        if target is None:
-            return
-        row = dict(
-            workspace=linear.workspace,
-            workspace_slug=linear.slug,
-            project_id=target["id"],
-            name=target["name"],
-        )
-        with store.lock():
-            store.save_project(row)
-    else:
-        row = store.project(*choice)
-        if row is None:
-            raise Error("项目元数据已不存在，请重新选择")
+    row = store.project(*choice)
+    if row is None:
+        raise Error("本地 WTR 项目已不存在，请重新选择")
     path = prompt.edit(row)
     notice("项目提示词已保存", str(path))
+
+
+def valid_project_name(value):
+    if not value.strip():
+        raise Error("WTR 项目名称不能为空")
+    return value.strip()
 
 
 def valid_root(value):
@@ -289,10 +281,16 @@ def suggested_baseline(repo):
 def save_binding(store, row, *, expected=None):
     # Keep the lock out of menus, Linear queries, and editor sessions.
     with store.lock():
-        current = store.binding(*bindings.key(row))
+        current = store.project(row["workspace"], row["project_id"])
         if current != expected:
-            raise Error("仓库绑定已被其他进程修改，请重新选择后再保存")
-        store.save_binding(row)
+            raise Error("WTR 项目已被其他进程修改，请重新选择后再保存")
+        if expected is None:
+            occupied = store.binding(*bindings.key(row))
+            if occupied is not None:
+                raise Error("该匹配对象已被其他 WTR 项目使用，请重新选择")
+            store.save_binding(row)
+        else:
+            store.replace_binding(expected, row)
 
 
 def add_binding(store, workspace):
@@ -331,7 +329,7 @@ def add_binding(store, workspace):
         return None
     row = bindings.from_target(linear, kind, target, dict(repo=repo, baseline=baseline, root=root))
     save_binding(store, row)
-    return bindings.key(row)
+    return row["workspace"], row["project_id"]
 
 
 def change_binding_target(store, row):
@@ -363,9 +361,7 @@ def change_binding_target(store, row):
     )
     if target is None:
         return None
-    replacement = bindings.from_target(
-        linear, kind, target, {field: row[field] for field in ("repo", "baseline", "root")}
-    )
+    replacement = bindings.from_target(linear, kind, target, dict(row, enabled=1))
     confirmed = menu(
         "确认修改匹配方式/对象",
         [(False, "保留原绑定"), (True, "确认修改")],
@@ -380,30 +376,35 @@ def change_binding_target(store, row):
         return None
     with store.lock():
         store.replace_binding(row, replacement)
-    return bindings.key(replacement)
+    return replacement["workspace"], replacement["project_id"]
 
 
 def binding_settings(store, key):
     selected = "baseline"
     while True:
-        row = store.binding(*key)
+        row = store.project(*key)
         if row is None:
-            notice("仓库绑定已不存在", "请返回绑定列表重新选择。")
+            notice("WTR 项目已不存在", "请返回项目列表重新选择。")
             return
         text = (
             f"绑定：{bindings.describe(row)}\nmain worktree：{row['repo']}\n"
             f"分支基线：{row['baseline']}\nissue worktree 根目录：{row['root']}\n"
-            "修改后即时保存，只影响新任务。"
+            f"agent：{row['agent'] or '继承全局'}\ntmux session：{row['tmux_session'] or '继承全局'}\n"
+            f"匹配：{'启用' if row['enabled'] else '停用'}\n修改后即时保存。"
         )
         action = menu(
-            f"绑定设置：{row['name']}",
+            f"项目设置：{row['name']}",
             [
-                ("target", "修改匹配方式/对象"),
+                ("target", "修改匹配方式/对象（启用匹配）"),
                 ("baseline", "修改新分支基线"),
                 ("root", "修改 issue worktree 根目录"),
                 ("repo", "重新绑定到当前仓库"),
-                ("remove", "解除仓库绑定"),
-                (None, "返回绑定列表"),
+                ("remove", "停用匹配"),
+                ("name", "重命名 WTR 项目"),
+                ("prompt", "编辑项目提示词"),
+                ("agent", "项目 agent 覆盖"),
+                ("tmux", "项目 tmux session 覆盖"),
+                (None, "返回项目列表"),
             ],
             text=text,
             default=selected,
@@ -441,18 +442,52 @@ def binding_settings(store, key):
                     )
                     if baseline is not None:
                         save_binding(store, dict(row, repo=repo, baseline=baseline), expected=row)
+            elif action == "name":
+                value = field("WTR 项目名称", row["name"], valid_project_name)
+                if value is not None:
+                    save_binding(store, dict(row, name=value), expected=row)
+            elif action == "prompt":
+                path = prompt.edit(row)
+                notice("项目提示词已保存", str(path))
+            elif action == "agent":
+                choice = menu(
+                    "项目 agent 覆盖",
+                    [
+                        ("inherit", "继承全局默认 agent"),
+                        *[(agent["name"], agent["label"]) for agent in agents.catalog()],
+                        (None, "返回"),
+                    ],
+                    default=row["agent"] or "inherit",
+                )
+                if choice is not None:
+                    if choice != "inherit":
+                        agents.get(choice)
+                    save_binding(
+                        store,
+                        dict(row, agent=None if choice == "inherit" else choice),
+                        expected=row,
+                    )
+            elif action == "tmux":
+                value = field(
+                    "项目 tmux session（留空继承全局）",
+                    row["tmux_session"] or "",
+                    lambda value: config.session_name(value) if value else "",
+                )
+                if value is not None:
+                    save_binding(store, dict(row, tmux_session=value or None), expected=row)
             elif action == "remove":
                 confirmed = menu(
-                    "确认解除绑定",
-                    [(False, "保留绑定"), (True, "确认解除绑定")],
-                    text=f"绑定：{bindings.describe(row)}\n仓库：{row['repo']}\n只解除仓库绑定，保留 worktree、项目提示词和执行记录。",
+                    "确认停用匹配",
+                    [(False, "保留匹配"), (True, "确认停用匹配")],
+                    text=f"项目：{bindings.describe(row)}\n仓库：{row['repo']}\n停用后保留本地项目、worktree、项目提示词和执行记录。",
                     default=False,
                 )
                 if confirmed is True:
                     with store.lock():
-                        if store.binding(*key) != row:
-                            raise Error("仓库绑定已被其他进程修改，请重新选择后再操作")
-                        store.remove_binding(*key)
+                        if store.project(*key) != row:
+                            raise Error("WTR 项目已被其他进程修改，请重新选择后再操作")
+                        if row["enabled"]:
+                            store.remove_binding(*bindings.key(row))
                     return
         except (Error, OSError, ValueError, sqlite3.Error) as exc:
             notice("操作失败", str(exc))
@@ -462,15 +497,15 @@ def binding_settings(store, key):
 
 def manage_bindings(store, workspace):
     while True:
-        rows = store.bindings(workspace)
+        rows = store.projects(workspace)
         choice = menu(
-            "仓库绑定",
+            "项目管理",
             [
-                ("add", "＋ 绑定当前仓库的 Project 或 Label"),
+                ("add", "＋ 创建 WTR 项目（匹配 Project 或 Label）"),
                 *binding_choices(rows),
                 (None, "返回配置"),
             ],
-            text=f"当前目录：{Path.cwd()}\n选择已有绑定进行编辑；新增绑定需要位于 main worktree 根目录。",
+            text=f"当前目录：{Path.cwd()}\n选择本地 WTR 项目进行编辑；新增项目需要位于 main worktree 根目录。",
             search=True,
         )
         if choice is None:
@@ -529,8 +564,7 @@ def set_tmux_session(store):
 
 def select_workspace(store, current):
     slugs = sorted(
-        {row["workspace_slug"] for row in store.bindings() + store.projects()}
-        | ({current} if current else set())
+        {row["workspace_slug"] for row in store.projects()} | ({current} if current else set())
     )
     choice = menu(
         "工作区筛选",
@@ -558,11 +592,11 @@ def run(store, workspace=None):
     while True:
         default = store.setting("agent") or "每次启动时选择"
         session = store.setting("tmux-session", "worktree-run")
-        rows = store.bindings(workspace)
+        rows = store.projects(workspace)
         action = menu(
             "wtr 配置",
             [
-                ("bindings", f"仓库绑定（{len(rows)} 个）"),
+                ("bindings", f"项目管理（{len(rows)} 个）"),
                 ("prompt", "项目提示词"),
                 ("agent", f"默认 agent：{default}"),
                 ("tmux", f"tmux session：{session}"),
@@ -570,7 +604,7 @@ def run(store, workspace=None):
                 ("overview", "查看当前配置"),
                 (None, "退出"),
             ],
-            text=f"当前目录：{Path.cwd()}\n工作区范围：{workspace or '全部（新增使用 Linear CLI 默认工作区）'}\n默认 agent 和 tmux 设置全局生效；确认后即时保存。",
+            text=f"当前目录：{Path.cwd()}\n工作区范围：{workspace or '全部（新增使用 Linear CLI 默认工作区）'}\n全局 agent 和 tmux 为默认值，项目可覆盖；确认后即时保存。",
             default=selected,
         )
         if action is None:
@@ -590,7 +624,7 @@ def run(store, workspace=None):
             elif action == "overview":
                 notice(
                     "当前配置",
-                    f"默认 agent：{default}\ntmux session：{session}\n工作区范围：{workspace or '全部'}\n仓库绑定：{len(rows)} 个\n数据库：{store.path}\n项目提示词目录：{prompt.directory()}",
+                    f"默认 agent：{default}\ntmux session：{session}\n工作区范围：{workspace or '全部'}\nWTR 项目：{len(rows)} 个\n数据库：{store.path}\n项目提示词目录：{prompt.directory()}",
                 )
         except (Error, OSError, ValueError, sqlite3.Error) as exc:
             notice("操作失败", str(exc))

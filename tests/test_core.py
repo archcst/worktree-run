@@ -98,8 +98,10 @@ class CoreTests(Sandbox):
         first = self.row()
         self.store.save_issue(first)
         worktree.prepare(first, associated=False)
+        other_binding = dict(self.binding, workspace="other", workspace_slug="other")
+        self.store.save_binding(other_binding)
         second = worktree.route(
-            self.store, SimpleNamespace(workspace="other", slug="other"), ISSUE, self.binding
+            self.store, SimpleNamespace(workspace="other", slug="other"), ISSUE, other_binding
         )
         self.assertNotEqual(first["branch"], second["branch"])
         self.assertNotEqual(first["worktree"], second["worktree"])
@@ -198,7 +200,7 @@ class CoreTests(Sandbox):
         self.assertEqual(plan["action"], "create")
         self.assertEqual(self.store.path.read_bytes(), before)
         self.assertFalse((self.base / "trees").exists())
-        self.assertFalse(prompt.prompt_path("ws-uuid", "project-1").exists())
+        self.assertFalse(prompt.prompt_path("ws-uuid", self.binding["project_id"]).exists())
         self.assertFalse((self.base / "tmux.sock").exists())
         self.assertEqual(len(worktree.worktrees(self.repo)), 1)
 

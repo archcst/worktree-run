@@ -102,6 +102,10 @@ def verify_baseline(repo, baseline):
 def route(store, linear, issue, binding):
     previous = store.issue(linear.workspace, issue["id"])
     if previous:
+        if not previous.get("wtr_project_id") or not store.project(
+            linear.workspace, previous["wtr_project_id"]
+        ):
+            raise Error("已有 issue 缺少明确的 WTR 项目关联，请先修复关联")
         repository(previous["repo"])
         previous.update(
             identifier=issue["identifier"],
@@ -109,6 +113,8 @@ def route(store, linear, issue, binding):
             project_id=(issue.get("project") or {}).get("id"),
         )
         return previous
+    if not store.project(linear.workspace, binding["project_id"]):
+        raise Error("WTR 项目不属于当前 workspace 或尚未保存")
     repo = repository(binding["repo"])
     root = Path(binding["root"]).expanduser().resolve()
     slug = issue["identifier"].lower()
@@ -130,6 +136,7 @@ def route(store, linear, issue, binding):
         identifier=issue["identifier"],
         workspace_slug=linear.slug,
         project_id=(issue.get("project") or {}).get("id"),
+        wtr_project_id=binding["project_id"],
         repo=repo,
         baseline=binding["baseline"],
         branch=branch,

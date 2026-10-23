@@ -25,7 +25,7 @@ class TmuxTests(Sandbox):
 
     def test_exit_retention_prompt_cwd_and_rerun(self):
         self.configure()
-        template = prompt.initialize("ws-uuid", "project-1")
+        template = prompt.initialize("ws-uuid", self.binding["project_id"])
         template.write_text(
             "{{issue_id}}\n'中文' \"space\" $(touch BAD) ; `false`\n" + "文" * 20000
         )
@@ -182,7 +182,7 @@ class TmuxTests(Sandbox):
         )
         self.assertEqual(self.store.all("SELECT * FROM runs"), [])
         self.assertFalse((self.base / "trees").exists())
-        self.assertFalse(prompt.prompt_path("ws-uuid", "project-1").exists())
+        self.assertFalse(prompt.prompt_path("ws-uuid", self.binding["project_id"]).exists())
         tmux.call("respawn-pane", "-t", pane, command)
         self.wait_for(lambda: "详情" in tmux.call("capture-pane", "-p", "-t", pane).stdout)
         tmux.call("send-keys", "-t", pane, "Enter")

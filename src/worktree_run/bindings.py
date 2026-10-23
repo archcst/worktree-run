@@ -1,4 +1,6 @@
-"""Repository binding identities, independent of project prompt templates."""
+"""Linear matching conditions for stable, local WTR projects."""
+
+import uuid
 
 KINDS = {"project": "Project", "label": "Label"}
 
@@ -23,7 +25,12 @@ def from_target(linear, kind, target, values):
         workspace_slug=linear.slug,
         kind=kind,
         target_id=target["id"],
-        name=target["name"],
+        target_name=target["name"],
+        name=values.get("name", target["name"]),
+        project_id=values.get("project_id") or str(uuid.uuid4()),
+        agent=values.get("agent"),
+        tmux_session=values.get("tmux_session"),
+        enabled=values.get("enabled", 1),
         team_name=f"{team['name']} ({team['key']})" if team else "",
     )
 
@@ -31,7 +38,9 @@ def from_target(linear, kind, target, values):
 def describe(row):
     scope = f" · {row['team_name'] or 'Workspace'}" if row["kind"] == "label" else ""
     return (
-        f"{KINDS[row['kind']]}: {row['name']}{scope} · {row['workspace_slug']} [{row['target_id']}]"
+        f"{row['name']} · {KINDS[row['kind']]}: {row['target_name']}{scope} "
+        f"· {row['workspace_slug']} [{row['project_id']}]"
+        + (" · 已停用匹配" if not row["enabled"] else "")
     )
 
 

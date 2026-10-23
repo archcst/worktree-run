@@ -1,4 +1,4 @@
-"""Versioned SQLite storage and a single-host orchestration lock."""
+"""SQLite storage for stable WTR projects, issue associations and execution history."""
 
 import fcntl
 import json
@@ -11,22 +11,27 @@ from pathlib import Path
 
 from .util import Error
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS bindings (
- workspace TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('project','label')),
- target_id TEXT NOT NULL, name TEXT NOT NULL, workspace_slug TEXT NOT NULL,
- team_name TEXT NOT NULL, repo TEXT NOT NULL, baseline TEXT NOT NULL, root TEXT NOT NULL,
- PRIMARY KEY(workspace, kind, target_id)
-);
-CREATE TABLE IF NOT EXISTS prompt_projects (
+PROJECT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS wtr_projects (
  workspace TEXT NOT NULL, project_id TEXT NOT NULL, name TEXT NOT NULL,
- workspace_slug TEXT NOT NULL, PRIMARY KEY(workspace, project_id)
+ workspace_slug TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('project','label')),
+ target_id TEXT NOT NULL, target_name TEXT NOT NULL, team_name TEXT NOT NULL,
+ repo TEXT NOT NULL, baseline TEXT NOT NULL, root TEXT NOT NULL,
+ agent TEXT, tmux_session TEXT, enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
+ PRIMARY KEY(workspace,project_id)
 );
+CREATE UNIQUE INDEX IF NOT EXISTS active_target ON wtr_projects(workspace,kind,target_id)
+ WHERE enabled=1;
+"""
+SCHEMA = (
+    PROJECT_SCHEMA
+    + """
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS issues (
  workspace TEXT NOT NULL, issue_id TEXT NOT NULL, identifier TEXT NOT NULL,
  workspace_slug TEXT NOT NULL, project_id TEXT, repo TEXT NOT NULL,
  baseline TEXT NOT NULL, branch TEXT NOT NULL, worktree TEXT NOT NULL UNIQUE,
+ wtr_project_id TEXT,
  PRIMARY KEY(workspace, issue_id), UNIQUE(repo, branch)
 );
 CREATE TABLE IF NOT EXISTS runs (
@@ -36,12 +41,23 @@ CREATE TABLE IF NOT EXISTS runs (
  CHECK(status IN ('preparing','running','awaiting_review','failed','interrupted')),
  created_at TEXT NOT NULL, started_at TEXT, ended_at TEXT, exit_code INTEGER,
  error TEXT, session_id TEXT, window_id TEXT, pane_id TEXT,
- tmux_socket TEXT, launch_command TEXT, agent_session TEXT
+ tmux_socket TEXT, launch_command TEXT, agent_session TEXT, wtr_project_id TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS active_issue ON runs(workspace, issue_id)
  WHERE status IN ('preparing','running');
-PRAGMA user_version = 2;
+PRAGMA user_version = 3;
 """
+)
+PROJECT_UPSERT = """INSERT INTO wtr_projects
+(workspace,project_id,name,workspace_slug,kind,target_id,target_name,team_name,
+ repo,baseline,root,agent,tmux_session,enabled)
+VALUES (:workspace,:project_id,:name,:workspace_slug,:kind,:target_id,:target_name,:team_name,
+ :repo,:baseline,:root,:agent,:tmux_session,:enabled)
+ON CONFLICT(workspace,project_id) DO UPDATE SET name=excluded.name,
+workspace_slug=excluded.workspace_slug,kind=excluded.kind,target_id=excluded.target_id,
+target_name=excluded.target_name,team_name=excluded.team_name,repo=excluded.repo,
+baseline=excluded.baseline,root=excluded.root,agent=excluded.agent,
+tmux_session=excluded.tmux_session,enabled=excluded.enabled"""
 
 
 def now():
@@ -59,24 +75,35 @@ class Store:
     def __init__(self, path=None, *, readonly=False):
         self.path = Path(path or default_db()).expanduser().resolve()
         self.readonly = readonly
-        if readonly and self.path.exists():
+        self.migration_backup = None
+        exists = self.path.exists()
+        if readonly and exists:
             self.db = sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True, timeout=30)
         else:
             if not readonly:
                 self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             self.db = sqlite3.connect(":memory:" if readonly else self.path, timeout=30)
         self.db.row_factory = sqlite3.Row
-        version = self.db.execute("PRAGMA user_version").fetchone()[0]
-        if version > 2 or (readonly and self.path.exists() and version < 2):
-            self.db.close()
-            if version > 2:
+        try:
+            version = self.db.execute("PRAGMA user_version").fetchone()[0]
+            if version > 3:
                 raise Error("数据库版本高于当前 wtr，请升级")
-            raise Error("请先运行 wtr config 配置仓库绑定，再使用只读预览")
-        if not readonly or not self.path.exists():
-            self.db.executescript(SCHEMA)
-            self.db.commit()
+            if readonly and exists and version < 3:
+                raise Error("请先运行 wtr config 升级 WTR 项目配置，再使用只读预览")
+            if version in (1, 2):
+                from .migration import migrate
+
+                with self.lock():
+                    # Another process may have finished the upgrade while this one waited.
+                    if self.db.execute("PRAGMA user_version").fetchone()[0] < 3:
+                        self.migration_backup = migrate(self)
+            elif version == 0:
+                self.db.executescript(SCHEMA)
             if not readonly:
                 self.path.chmod(0o600)
+        except BaseException:
+            self.db.close()
+            raise
 
     def close(self):
         self.db.close()
@@ -98,8 +125,7 @@ class Store:
     def lock(self):
         if self.readonly:
             raise Error("只读模式不能认领执行任务")
-        lock_path = self.path.with_suffix(".lock")
-        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        fd = os.open(self.path.with_suffix(".lock"), os.O_CREAT | os.O_RDWR, 0o600)
         with os.fdopen(fd, "a") as handle:
             fcntl.flock(handle, fcntl.LOCK_EX)
             try:
@@ -119,86 +145,53 @@ class Store:
 
     def bindings(self, workspace=None):
         return self.all(
-            "SELECT * FROM bindings WHERE (? IS NULL OR workspace_slug=?) "
-            "ORDER BY workspace_slug,kind,name,target_id",
+            "SELECT * FROM wtr_projects WHERE enabled=1 AND (? IS NULL OR workspace_slug=?) "
+            "ORDER BY workspace_slug,name,project_id",
             (workspace, workspace),
-        )
-
-    def binding(self, workspace, kind, target_id):
-        return self.one(
-            "SELECT * FROM bindings WHERE workspace=? AND kind=? AND target_id=?",
-            (workspace, kind, target_id),
-        )
-
-    def save_binding(self, row):
-        self.write(
-            """INSERT INTO bindings
-            (workspace,kind,target_id,name,workspace_slug,team_name,repo,baseline,root)
-            VALUES (:workspace,:kind,:target_id,:name,:workspace_slug,:team_name,:repo,:baseline,:root)
-            ON CONFLICT(workspace,kind,target_id) DO UPDATE SET name=excluded.name,
-            workspace_slug=excluded.workspace_slug,team_name=excluded.team_name,
-            repo=excluded.repo,baseline=excluded.baseline,root=excluded.root""",
-            row,
-        )
-        if row["kind"] == "project":
-            self.save_project(dict(row, project_id=row["target_id"]))
-
-    def replace_binding(self, previous, row):
-        """Replace a binding atomically after the caller's interactive work is complete."""
-        if self.readonly:
-            raise Error("只读模式不能修改数据库")
-        if previous["workspace"] != row["workspace"]:
-            raise Error("不能将仓库绑定移到其他 workspace")
-        old_key = (previous["workspace"], previous["kind"], previous["target_id"])
-        new_key = (row["workspace"], row["kind"], row["target_id"])
-        with self.db:
-            self.db.execute("BEGIN IMMEDIATE")
-            if self.binding(*old_key) != previous:
-                raise Error("仓库绑定已被其他进程修改，请重新选择后再保存")
-            if new_key != old_key and self.binding(*new_key):
-                raise Error("目标 Project/Label 已被其他绑定占用，未修改原绑定")
-            self.db.execute(
-                """UPDATE bindings SET kind=:kind,target_id=:target_id,name=:name,
-                workspace_slug=:workspace_slug,team_name=:team_name,repo=:repo,
-                baseline=:baseline,root=:root
-                WHERE workspace=:workspace AND kind=:old_kind AND target_id=:old_target_id""",
-                dict(row, old_kind=previous["kind"], old_target_id=previous["target_id"]),
-            )
-            if row["kind"] == "project":
-                self.db.execute(
-                    """INSERT INTO prompt_projects (workspace,project_id,name,workspace_slug)
-                    VALUES (:workspace,:target_id,:name,:workspace_slug)
-                    ON CONFLICT(workspace,project_id) DO UPDATE SET name=excluded.name,
-                    workspace_slug=excluded.workspace_slug""",
-                    row,
-                )
-
-    def remove_binding(self, workspace, kind, target_id):
-        self.write(
-            "DELETE FROM bindings WHERE workspace=? AND kind=? AND target_id=?",
-            (workspace, kind, target_id),
         )
 
     def projects(self, workspace=None):
         return self.all(
-            "SELECT * FROM prompt_projects WHERE (? IS NULL OR workspace_slug=?) "
-            "ORDER BY workspace_slug,name",
+            "SELECT * FROM wtr_projects WHERE (? IS NULL OR workspace_slug=?) "
+            "ORDER BY workspace_slug,name,project_id",
             (workspace, workspace),
         )
 
     def project(self, workspace, project_id):
         return self.one(
-            "SELECT * FROM prompt_projects WHERE workspace=? AND project_id=?",
-            (workspace, project_id),
+            "SELECT * FROM wtr_projects WHERE workspace=? AND project_id=?", (workspace, project_id)
         )
 
-    def save_project(self, row):
+    def binding(self, workspace, kind, target_id):
+        return self.one(
+            "SELECT * FROM wtr_projects WHERE enabled=1 AND workspace=? AND kind=? AND target_id=?",
+            (workspace, kind, target_id),
+        )
+
+    def save_binding(self, row):
+        self.write(PROJECT_UPSERT, row)
+        return self.project(row["workspace"], row["project_id"])
+
+    def replace_binding(self, previous, row):
+        """Caller holds the orchestration lock. Local project identity cannot change."""
+        if self.readonly:
+            raise Error("只读模式不能修改数据库")
+        if (previous["workspace"], previous["project_id"]) != (row["workspace"], row["project_id"]):
+            raise Error("不能改变 WTR 项目的身份或 workspace")
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            if self.project(previous["workspace"], previous["project_id"]) != previous:
+                raise Error("WTR 项目已被其他进程修改，请重新选择后再保存")
+            occupied = self.binding(row["workspace"], row["kind"], row["target_id"])
+            if row["enabled"] and occupied and occupied["project_id"] != row["project_id"]:
+                raise Error("目标 Project/Label 已被其他绑定占用，未修改原项目")
+            self.db.execute(PROJECT_UPSERT, row)
+
+    def remove_binding(self, workspace, kind, target_id):
+        # Disable matching, but retain the project and its configuration for pinned issues.
         self.write(
-            """INSERT INTO prompt_projects (workspace,project_id,name,workspace_slug)
-            VALUES (:workspace,:project_id,:name,:workspace_slug)
-            ON CONFLICT(workspace,project_id) DO UPDATE SET name=excluded.name,
-            workspace_slug=excluded.workspace_slug""",
-            row,
+            "UPDATE wtr_projects SET enabled=0 WHERE workspace=? AND kind=? AND target_id=?",
+            (workspace, kind, target_id),
         )
 
     def issue(self, workspace, issue_id):
@@ -207,10 +200,13 @@ class Store:
         )
 
     def save_issue(self, row):
-        # The association is reserved before Git runs. A failure remains retryable.
+        previous = self.issue(row["workspace"], row["issue_id"])
+        if previous and previous["wtr_project_id"] != row["wtr_project_id"]:
+            raise Error("已有 issue 的 WTR 项目关联不能自动改变")
         self.write(
-            """INSERT INTO issues VALUES (:workspace,:issue_id,:identifier,:workspace_slug,
-            :project_id,:repo,:baseline,:branch,:worktree)
+            """INSERT INTO issues
+            (workspace,issue_id,identifier,workspace_slug,project_id,repo,baseline,branch,worktree,wtr_project_id)
+            VALUES (:workspace,:issue_id,:identifier,:workspace_slug,:project_id,:repo,:baseline,:branch,:worktree,:wtr_project_id)
             ON CONFLICT(workspace,issue_id) DO UPDATE SET identifier=excluded.identifier,
             workspace_slug=excluded.workspace_slug,project_id=excluded.project_id""",
             row,
@@ -226,8 +222,8 @@ class Store:
         run_id = str(uuid.uuid4())
         self.write(
             """INSERT INTO runs
-            (id,workspace,issue_id,identifier,agent,argv,cwd,workspace_slug,status,created_at,tmux_socket)
-            VALUES (?,?,?,?,?,?,?,?, 'preparing',?,?)""",
+            (id,workspace,issue_id,identifier,agent,argv,cwd,workspace_slug,status,created_at,tmux_socket,wtr_project_id)
+            VALUES (?,?,?,?,?,?,?,?, 'preparing',?,?,?)""",
             (
                 run_id,
                 issue["workspace"],
@@ -239,6 +235,7 @@ class Store:
                 issue["workspace_slug"],
                 now(),
                 socket,
+                issue["wtr_project_id"],
             ),
         )
         return run_id

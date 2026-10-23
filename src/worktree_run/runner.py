@@ -39,10 +39,15 @@ def plan(store, linear, issue, binding, agent_name):
     row = worktree.route(store, linear, issue, binding)
     action = worktree.inspect(row, associated=bool(store.issue(linear.workspace, issue["id"])))
     agent = agents.get(agent_name)
-    text = prompt.render(issue["identifier"], linear.slug, linear.workspace, row["project_id"])
+    project = store.project(linear.workspace, row["wtr_project_id"])
+    if project is None:
+        raise Error("WTR 项目不存在，请先修复项目关联")
+    text = prompt.render(issue["identifier"], linear.slug, linear.workspace, project["project_id"])
     # Resolve once against the launcher's PATH, not an old tmux server environment.
     argv = agent.launch_argv(text)
-    session = config.session_name(store.setting("tmux-session", "worktree-run"))
+    session = config.session_name(
+        project["tmux_session"] or store.setting("tmux-session", "worktree-run")
+    )
     require("tmux")
     return row, action, argv, session
 
@@ -55,16 +60,7 @@ def launch(store, linear, issue, binding, agent_name):
     store.save_issue(row)
     run_id = store.new_run(row, agent_name, argv, tmux.endpoint)
     try:
-        if issue.get("project"):
-            store.save_project(
-                dict(
-                    workspace=linear.workspace,
-                    workspace_slug=linear.slug,
-                    project_id=issue["project"]["id"],
-                    name=issue["project"]["name"],
-                )
-            )
-        prompt.initialize(row["workspace"], row["project_id"])
+        prompt.initialize(row["workspace"], row["wtr_project_id"])
         worktree.prepare(row, associated=associated)
         name = issue["identifier"]
         others = store.all(
